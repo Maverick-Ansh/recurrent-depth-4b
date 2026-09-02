@@ -105,14 +105,21 @@ class LoRALinear(nn.Module):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.rank, self.scale = rank, alpha / rank
-        dt, dv = base.weight.dtype, base.weight.device
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=dt, device=dv))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=dt, device=dv))
+        # Trainable params are fp32 while the frozen base stays fp16: a
+        # GradScaler refuses to unscale fp16 gradients, so the master copy of
+        # anything we optimise has to be fp32. The rank-r factors are tiny, so
+        # casting them to the activation dtype per call costs nothing.
+        dv = base.weight.device
+        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=torch.float32, device=dv))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32, device=dv))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))   # B stays zero: dW = 0 at init
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x):
-        return self.base(x) + self.scale * F.linear(F.linear(self.dropout(x), self.lora_A), self.lora_B)
+        h = self.dropout(x)
+        h = F.linear(h, self.lora_A.to(h.dtype))
+        h = F.linear(h, self.lora_B.to(h.dtype))
+        return self.base(x) + self.scale * h
 
 
 def inject_lora(module: nn.Module, targets, rank=16, alpha=32, dropout=0.0) -> int:
@@ -152,15 +159,15 @@ class RecurrentDepthRetrofit(nn.Module):
         self.final_norm = inner.norm
         self.lm_head = hf_model.lm_head
 
-        dt = self.embed_tokens.weight.dtype
+        # adapter and core_norm are trained, so they are fp32 (see LoRALinear)
         if injection == "concat":
-            self.adapter = nn.Linear(2 * self.h, self.h, bias=False).to(dt)
+            self.adapter = nn.Linear(2 * self.h, self.h, bias=False, dtype=torch.float32)
             self._init_adapter(adapter_init)
         else:
             self.adapter = None
 
         # n_c: calibrated in `calibrate` below, identity-ish until then
-        self.core_norm = _RMSNorm(self.h, hf_model.config.rms_norm_eps).to(dt) if core_norm else None
+        self.core_norm = _RMSNorm(self.h, hf_model.config.rms_norm_eps) if core_norm else None
         self.sigma_s = 1.0                       # calibrated
         for p in self.hf.parameters():
             p.requires_grad_(False)
@@ -201,11 +208,14 @@ class RecurrentDepthRetrofit(nn.Module):
         return self._run(self.prelude, x, pos, rope), pos, rope
 
     def inject(self, s, e):
+        """The adapter A of Sec. 3.2, applied to concat(s_i, e)."""
         if self.injection == "concat":
-            return self.adapter(torch.cat([s, e], dim=-1))
+            # A is fp32 (it is trained); cast it, not the activations
+            cat = torch.cat([s, e], dim=-1)
+            return F.linear(cat, self.adapter.weight.to(cat.dtype))
         if self.injection == "add":
-            return s + e
-        return s
+            return s + e            # "re-incorporation ... via addition"
+        return s                    # "none": no per-step injection (ablation)
 
     def core_forward(self, s, e, pos, rope):
         x = self._run(self.core, self.inject(s, e), pos, rope)
