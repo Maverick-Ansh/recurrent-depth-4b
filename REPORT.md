@@ -346,6 +346,15 @@ moves again. **The model did not learn an iterative algorithm; it learned a
 contraction that converges in about five turns.** Every turn after that is
 arithmetic that provably cannot change the answer.
 
+**This is convergence, not collapse, and the paper's own diagnostic separates
+them.** Token correlation at the final state is 0.470, nowhere near the 1.0 that
+Fig. 5 uses to identify representation collapse. Different positions hold
+different states; the fixed point is a function of the input, not a constant. So
+the model is computing something real and reaching it quickly — the failure is
+not that the recurrence broke, but that it had nothing left to do. Reporting
+these as the same failure would be wrong, and without the token-correlation
+metric they would look identical from the loss curve alone.
+
 This is worth stating as a mechanism rather than as a disappointment, because it
 falls straight out of the objective. Training minimises the loss *in expectation
 over r drawn from Λ*. A function that is constant in r is correct at every r
