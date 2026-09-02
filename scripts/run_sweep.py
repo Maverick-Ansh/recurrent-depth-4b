@@ -23,8 +23,8 @@ def build_queue(steps: int, lr: float, out: str):
     """(name, argv) pairs, ordered so the claims that matter land first."""
     # Two seeds on the arms that carry C1/C2; one on the ablations, whose read-out
     # is a qualitative "does the r-curve survive at all", not a small delta.
-    two_seeds = ["rec", "fixed1", "fixedr"]           # C1, C2, C1-mechanism
-    one_seed = ["noinject", "prenorm", "dets0", "hi_lr", "fullbp"]
+    two_seeds = ["rec", "fixed1"]                     # C1 and its Table-4 twin
+    one_seed = ["fixedr", "noinject", "prenorm", "dets0", "hi_lr", "fullbp"]
     q = []
     for arm in two_seeds:
         for seed in (0, 1):
