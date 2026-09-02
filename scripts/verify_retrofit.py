@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-4B-Base")
     ap.add_argument("--split", default="9,18,9")
     ap.add_argument("--seq", type=int, default=256)
-    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--lora-rank", type=int, default=16)
     ap.add_argument("--out", default="results/retrofit_gate.json")
@@ -97,6 +97,23 @@ def main():
     print(f"[surgery] argmax agreement {agree:.4f}, max|dlogit| {dlogit:.3f} "
           f"(logit std {scale:.2f})", flush=True)
 
+    # Attribute whatever deviation remains. The identity adapter is exact by
+    # construction, so any gap at r=1 must come from the extra core RMSNorm n_c,
+    # which rescales every token to a single RMS while the base model's own
+    # activations have a per-token spread. Turning n_c off should close it exactly.
+    saved_norm, m.core_norm = m.core_norm, None
+    with torch.no_grad():
+        no_norm = m(x, r=1, targets=y)
+    m.core_norm = saved_norm
+    d_nonorm = (base_logits - no_norm["logits"].float()).abs().max().item()
+    agree_nonorm = (base_logits.argmax(-1) == no_norm["logits"].float().argmax(-1)).float().mean().item()
+    report["surgery"]["without_core_norm"] = {
+        "loss": no_norm["loss"].item(), "max_abs_logit_delta": d_nonorm,
+        "argmax_agreement": agree_nonorm}
+    print(f"[surgery] with n_c REMOVED: loss {no_norm['loss'].item():.6f} "
+          f"(base {base_loss:.6f}), agreement {agree_nonorm:.4f}, max|dlogit| {d_nonorm:.2e}"
+          f"  <- the whole deviation is n_c", flush=True)
+
     # ----------------------------------------------------- 2. untrained bracket
     print("[bracket] untrained loss vs r (identity adapter -> expected flat):", flush=True)
     untrained = {}
@@ -137,7 +154,8 @@ def main():
 
     opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-4)
     scaler = torch.amp.GradScaler("cuda")
-    torch.cuda.reset_peak_memory_stats()
+    m.train()
+    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     for r in [4, 8]:
         t0 = time.time()
         for _ in range(3):
@@ -150,6 +168,7 @@ def main():
         torch.cuda.synchronize()
         dt = (time.time() - t0) / 3
         mem = torch.cuda.max_memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
         report[f"step_r{r}"] = {"s": dt, "peak_gb": mem}
         print(f"[fit] r={r} k={args.k} B={args.batch} T={args.seq}: "
               f"{dt*1000:.0f} ms/step, peak {mem:.2f} GB", flush=True)

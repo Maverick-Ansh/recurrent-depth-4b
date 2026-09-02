@@ -68,6 +68,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def chunked_cross_entropy(logits, targets, chunk: int = 64, ignore_index: int = -100):
+    """Cross entropy without materialising an fp32 (B, T, 151936) tensor.
+
+    Qwen's vocabulary is 151936, so at B=2, T=256 the fp32 upcast of the logits
+    alone is 300 MB and it is what pushed a 15.6 GB T4 over the edge. Summing
+    the loss over sequence chunks keeps only one chunk upcast at a time.
+    """
+    B, T, V = logits.shape
+    total = logits.new_zeros((), dtype=torch.float32)
+    n = 0
+    for i in range(0, T, chunk):
+        lg = logits[:, i:i + chunk].reshape(-1, V)
+        tg = targets[:, i:i + chunk].reshape(-1)
+        cnt = int((tg != ignore_index).sum())
+        if cnt == 0:
+            continue
+        total = total + F.cross_entropy(lg.float(), tg, ignore_index=ignore_index,
+                                        reduction="sum")
+        n += cnt
+    return total / max(n, 1)
+
+
 # ------------------------------------------------------------------ minimal LoRA
 class LoRALinear(nn.Module):
     """y = W x + (alpha/rank) * B(A x).  W frozen, A/B trained.
@@ -110,7 +132,8 @@ class RecurrentDepthRetrofit(nn.Module):
 
     def __init__(self, hf_model, l_prelude: int, l_core: int, l_coda: int,
                  injection: str = "concat", adapter_init: str = "identity",
-                 core_norm: bool = True, backprop_depth: int = 2, random_s0: bool = True):
+                 core_norm: bool = True, backprop_depth: int = 2, random_s0: bool = True,
+                 grad_checkpoint: bool = True):
         super().__init__()
         self.hf = hf_model
         inner = hf_model.model
@@ -119,6 +142,7 @@ class RecurrentDepthRetrofit(nn.Module):
         self.lP, self.lR, self.lC = l_prelude, l_core, l_coda
         self.h = hf_model.config.hidden_size
         self.injection, self.backprop_depth, self.random_s0 = injection, backprop_depth, random_s0
+        self.grad_checkpoint = grad_checkpoint
 
         self.embed_tokens = inner.embed_tokens
         self.rotary = inner.rotary_emb
@@ -214,15 +238,21 @@ class RecurrentDepthRetrofit(nn.Module):
                         states.append(s)
             s = s.detach()
         for _ in range(k):
-            s = self.core_forward(s, e, pos, rope)
+            if self.grad_checkpoint and self.training and not return_states:
+                # App. A.2: "gradient checkpointing on a per-iteration granularity".
+                # One checkpoint per recurrence step, so activation memory is
+                # O(one core step) instead of O(k core steps).
+                s = torch.utils.checkpoint.checkpoint(
+                    self.core_forward, s, e, pos, rope, use_reentrant=False)
+            else:
+                s = self.core_forward(s, e, pos, rope)
             if return_states:
                 states.append(s)
 
         logits = self.coda_forward(s, pos, rope)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(),
-                                   targets.reshape(-1), ignore_index=ignore_index)
+            loss = chunked_cross_entropy(logits, targets, ignore_index=ignore_index)
         out = {"logits": logits, "loss": loss, "state": s}
         if return_states:
             out["states"] = torch.stack(states)
@@ -293,12 +323,14 @@ class _RMSNorm(nn.Module):
 
 def build_retrofit(model_id="Qwen/Qwen3-4B-Base", split=(9, 18, 9), adapter_init="identity",
                    dtype=torch.float16, device="cuda", lora_rank=16, lora_alpha=32,
-                   backprop_depth=2, injection="concat", core_norm=True, attn="sdpa"):
+                   backprop_depth=2, injection="concat", core_norm=True, attn="sdpa",
+                   grad_checkpoint=True):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_id)
     hf = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, attn_implementation=attn)
     hf.to(device).eval()
     m = RecurrentDepthRetrofit(hf, *split, injection=injection, adapter_init=adapter_init,
-                               core_norm=core_norm, backprop_depth=backprop_depth)
+                               core_norm=core_norm, backprop_depth=backprop_depth,
+                               grad_checkpoint=grad_checkpoint)
     m.to(device)          # the adapter and core_norm are new modules, still on CPU
     return m, tok
