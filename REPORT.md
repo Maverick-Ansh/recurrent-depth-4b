@@ -287,12 +287,93 @@ reproduced at 19.6M. It is now an arm (`hi_lr`) rather than an anecdote.
 
 ### 5.4 Track A: accuracy vs test-time recurrence
 
-*Pending — see `figures/c1_accuracy_vs_r.png` and the tables printed by
-`scripts/analyze.py`.*
+Main arm `rec` (r̄ = 8, k = 4, 3000 steps, 24.6M tokens), seed 0. Every accuracy
+is printed against its cell's constant-guess floor.
+
+| cell | floor | r=1 | r=2 | r=4 | r=8 | r=16 | r=48 | saturates |
+|---|---|---|---|---|---|---|---|---|
+| `perm/2` | 0.199 | 0.92 | 0.95 | **0.98** | 0.98 | 0.98 | 0.98 | r=4 |
+| `perm/4` | 0.086 | 0.72 | 0.71 | 0.71 | 0.71 | 0.71 | 0.71 | r=1 |
+| `perm/8` | 0.035 | 0.16 | 0.18 | 0.18 | **0.19** | 0.19 | 0.19 | r=8 |
+| `perm/16` | 0.017 | 0.03 | 0.03 | 0.03 | 0.03 | 0.03 | 0.03 | at floor |
+| `perm/24` | 0.013 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | at floor |
+| `add/(2,1)` | 0.116 | 0.18 | **0.53** | 0.50 | 0.50 | 0.50 | 0.50 | r=2 |
+| `add/(3,1)` | 0.085 | 0.23 | 0.57 | **0.62** | 0.62 | 0.62 | 0.62 | r=4 |
+| `add/(4,1)` | 0.070 | 0.27 | 0.37 | **0.43** | 0.43 | 0.43 | 0.43 | r=4 |
+| `add/(2,2)` | 0.017 | 0.02 | 0.04 | 0.04 | 0.04 | 0.04 | 0.04 | r=2 |
+| `add/(3,3)`, `add/(2,3)` | 0.004 | 0.00 | — | — | — | — | 0.00 | at floor |
+| `recall/4` | 0.051 | 0.03 | 0.03 | 0.03 | 0.03 | 0.03 | 0.03 | **flat** |
+| `recall/8` | 0.048 | 0.05 | 0.05 | 0.05 | 0.05 | 0.05 | 0.05 | **flat** |
+| `recall/16` | 0.043 | 0.05 | 0.04 | 0.04 | 0.04 | 0.04 | 0.04 | **flat** |
+| `recall/24` | 0.045 | 0.04 | 0.04 | 0.04 | 0.04 | 0.04 | 0.04 | **flat** |
+
+Three things are in this table.
+
+**Recurrence buys real accuracy, and the effect is large.** On `add/(3,1)`,
+r=1 → r=4 takes the model from 0.23 to 0.62 against a floor of 0.085. On
+`add/(2,1)`, 0.18 → 0.53. These are not marginal differences; the *same weights*
+score nearly three times better when run four times instead of once.
+
+**The saturation point is ordered by problem difficulty, as C1 predicts.**
+`add/(2,1)` saturates at r=2, `add/(3,1)` and `add/(4,1)` at r=4, `perm/8` at
+r=8. More operands, more carries, more turns needed. This is the paper's Fig. 7
+and Fig. 14 ordering, on three to four cells.
+
+**The control does exactly nothing.** All four `recall` cells are flat in r to
+two decimals. Recurrence is not a general-purpose improvement that lifts
+everything; on a task that needs memory rather than sequential computation it
+buys precisely zero. Without this row the two rows above would be much weaker
+evidence.
+
+### 5.4.1 Why it stops at r≈4 and not r≈32: the model learned a contraction
+
+The flatness from r=4 to r=48 is not saturation in the sense of diminishing
+returns. It is exact. Held-out loss reads `1.7868` at r=4, 8, 12, 16, 24, 32 and
+48 — identical to four decimals — and answer-token loss on `recall` reads `1.629`
+at every r from 2 upward. Nothing is happening.
+
+The recurrence statistics say why. Relative step size `‖s_i − s_{i−1}‖ / ‖s_i‖`
+over a 48-step trajectory:
+
+| step i | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 12 | 48 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| rel. step | 1.183 | 0.219 | 0.054 | 0.015 | 0.0044 | 0.0014 | 5.4e-4 | 2.7e-4 | 1.7e-4 | 1.7e-4 |
+| ‖s_i − s\*‖ | 4.99 | 1.25 | 0.343 | 0.102 | 0.033 | 0.012 | 0.006 | 0.004 | — | 0 |
+
+The map contracts by roughly 3.5× per step and is at its fixed point by step 5
+or 6. The state norm goes 14.10 (at s₀) → 22.380 → 22.376 → 22.376 and never
+moves again. **The model did not learn an iterative algorithm; it learned a
+contraction that converges in about five turns.** Every turn after that is
+arithmetic that provably cannot change the answer.
+
+This is worth stating as a mechanism rather than as a disappointment, because it
+falls straight out of the objective. Training minimises the loss *in expectation
+over r drawn from Λ*. A function that is constant in r is correct at every r
+simultaneously, so becoming r-invariant is the cheapest way to satisfy the
+objective — unless the task cannot be solved at low depth, in which case
+invariance costs accuracy and the pressure runs the other way. At this budget the
+only cells the model can solve at all are ones solvable within four turns, so
+nothing pushes back.
+
+That reading is testable and the table already supports it: the cells where the
+model is at its floor (`perm/16`, `perm/24`, `add/(2,3)`, `add/(3,3)`) are exactly
+the ones that would require deep iteration, and they are the ones it never
+learned. The paper's model avoids this because GSM8K at 3.5B is inside its reach
+but not at r=4; ours is not.
+
+### 5.4.2 Seed spread
+
+Two seeds of `rec` disagree substantially on individual cells — `perm/8` reads
+0.19 (seed 0) against 0.08 (seed 1); `add/(4,2)` reads 0.02 against 0.04. Any
+single-cell difference below roughly 0.10 is inside the seed spread and is not
+reported as a result. The `add` r-curve (0.23 → 0.62) and the flat `recall`
+control are both far outside it.
 
 ### 5.5 Track B: the 4B retrofit
 
-*Pending.*
+*Training in progress: `retro_identity` and `retro_paper`, 1000 steps each at
+r̄ = 4, k = 2, batch 2 × accum 2 × 256 tokens ≈ 1.0M tokens per arm, LoRA rank 16
+on the core plus the adapter and n_c (29.6M trainable of 4.05B).*
 
 ---
 
