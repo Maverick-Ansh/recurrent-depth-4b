@@ -159,6 +159,23 @@ def main():
                 line += f"{ff:>14.3f}{best_r-ff:>+10.3f}"
             print(line)
 
+    # ------------------------------------- C3: where did the capability go?
+    print("\n" + "=" * 92)
+    print("C3  gains live in the recurrence, not the prelude/coda  (paper Table 4)")
+    print("=" * 92)
+    print("Paper Table 4 reports its recurrent model evaluated at r=1 scoring BELOW the")
+    print("fixed-depth twin (ARC-E 34.89 vs 46.42) even though they share an architecture:")
+    print("the recurrent model never learned to solve anything in a single pass. If our")
+    print("rec@r=1 also sits below fixed1@best, the capability is in the loop, not the ends.")
+    if "rec" in runs and "fixed1" in runs:
+        print(f"\n{'task':<22}{'rec@r=1':>10}{'fixed1@best':>13}{'delta':>10}{'rec@best':>10}")
+        for t in tasks:
+            mu_r, _ = summary[("rec", t)]
+            r1 = mu_r[min(mu_r)]
+            f1 = max(summary[("fixed1", t)][0].values())
+            print(f"{t+' ('+TASK_GROUP[t]+')':<22}{r1:>10.3f}{f1:>13.3f}"
+                  f"{r1-f1:>+10.3f}{max(mu_r.values()):>10.3f}")
+
     # -------------------------------------------------------- C4 / C5 ablations
     print("\n" + "=" * 92)
     print("C4/C5  ablations: does the r-curve survive?  (slope = acc@r_max - acc@r=1)")
