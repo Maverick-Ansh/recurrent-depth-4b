@@ -40,12 +40,12 @@ import torch
 import torch.nn.functional as F
 
 
-# --------------------------------------------------------------------------
-# 6.1  Per-position adaptive exit, teacher-forced (the Figure 10 measurement)
-# --------------------------------------------------------------------------
-@torch.no_grad()
-def adaptive_exit_forward(model, idx, r_max: int = 64, threshold: float = 5e-4,
-                          s0=None, generator=None):
+# --------------------------------------------------------------------------                        # +-- STOP LOOPING WHEN THE ANSWER STOPS MOVING ------------------
+# 6.1  Per-position adaptive exit, teacher-forced (the Figure 10 measurement)                       # | The loop runs, and after each turn the coda is applied to get
+# --------------------------------------------------------------------------                        # | a next-token distribution. When that distribution stops
+@torch.no_grad()                                                                                    # | changing, more turns cannot change the answer, so the position
+def adaptive_exit_forward(model, idx, r_max: int = 64, threshold: float = 5e-4,                     # | is finished. The measure of change is the KL divergence
+                          s0=None, generator=None):                                                 # | between this turn's distribution and the previous turn's;
     """Iterate the core, freezing each sequence position's logits at the step
     where KL(p_i || p_{i-1}) first falls below `threshold`.
 
@@ -53,18 +53,18 @@ def adaptive_exit_forward(model, idx, r_max: int = 64, threshold: float = 5e-4,
     exact per-token exit-step distribution -- the histogram of the paper's
     Fig. 10 -- together with the logits the model would actually have emitted.
     """
-    e, _ = model.prelude_forward(idx)
-    s = model.init_state(e, generator) if s0 is None else s0
-    B, S = idx.shape
-    exit_step = torch.full((B, S), r_max, device=idx.device, dtype=torch.long)
-    done = torch.zeros(B, S, dtype=torch.bool, device=idx.device)
-    frozen, prev_logp = None, None
-
-    for i in range(1, r_max + 1):
-        s, _ = model.core_forward(s, e)
-        logits, _ = model.coda_forward(s)
-        if frozen is None:
-            frozen = logits.clone()
+    e, _ = model.prelude_forward(idx)                                                               # | below the threshold, that position's logits are frozen and it
+    s = model.init_state(e, generator) if s0 is None else s0                                        # | stops being updated while other positions keep going. Every
+    B, S = idx.shape                                                                                # | position is computed in parallel here, so this needs no cache
+    exit_step = torch.full((B, S), r_max, device=idx.device, dtype=torch.long)                      # | at all and produces an exact per-token distribution of how
+    done = torch.zeros(B, S, dtype=torch.bool, device=idx.device)                                   # | many turns each token needed. That distribution is the
+    frozen, prev_logp = None, None                                                                  # | interesting object: it says which tokens the model found hard
+                                                                                                    # | without anyone labelling them. The cost is running the coda
+    for i in range(1, r_max + 1):                                                                   # | every turn instead of once, which is why the saving is counted
+        s, _ = model.core_forward(s, e)                                                             # | in core turns rather than wall clock. torch.where keeps
+        logits, _ = model.coda_forward(s)                                                           # | finished positions frozen rather than breaking out of the
+        if frozen is None:                                                                          # | loop, because the batch shares one loop and different
+            frozen = logits.clone()                                                                 # | positions finish at different times.
         else:                                   # positions still running get updated
             frozen = torch.where(done.unsqueeze(-1), frozen, logits)
         logp = F.log_softmax(logits.float(), dim=-1)
@@ -81,10 +81,10 @@ def adaptive_exit_forward(model, idx, r_max: int = 64, threshold: float = 5e-4,
             "mean_steps": exit_step.float().mean().item()}
 
 
-# --------------------------------------------------------------------------
-# 6.2 / 6.3  Cached autoregressive decoding with a recurrence KV budget
-# --------------------------------------------------------------------------
-class RecurrenceKVCache:
+# --------------------------------------------------------------------------                        # +-- ONE CACHE SLOT PER TURN, OR FEWER --------------------------
+# 6.2 / 6.3  Cached autoregressive decoding with a recurrence KV budget                             # | Every turn of the core writes its own keys and values, so an
+# --------------------------------------------------------------------------                        # | unbudgeted cache costs r times what a normal transformer's
+class RecurrenceKVCache:                                                                            # | does. The budget caps that: turn i reads and writes slot (i-1)
     """Per-recurrence-step KV cache with the Sec. 6.2 modular budget.
 
     Without a budget, recurrence step i owns its own cache; memory grows like
@@ -102,19 +102,19 @@ class RecurrenceKVCache:
     the paper's "overwriting the KV-cache of the 1st step when executing the
     17th step".
     """
-
-    def __init__(self, n_layers: int, budget: int | None):
-        self.budget = budget
-        self.n_layers = n_layers
-        self.committed: dict[int, list] = {}
-        self.pending: dict[int, list] = {}
-
-    def slot_of(self, step: int) -> int:
-        return (step - 1) % self.budget if self.budget else step - 1
-
-    def begin_block(self):
-        self.pending = {}
-
+                                                                                                    # | mod budget, so turn 1 and turn budget+1 land in the same place
+    def __init__(self, n_layers: int, budget: int | None):                                          # | and the later one overwrites the earlier. The split between
+        self.budget = budget                                                                        # | committed and pending is the part that is easy to get wrong,
+        self.n_layers = n_layers                                                                    # | and getting it wrong here produced a real bug. A slot holds
+        self.committed: dict[int, list] = {}                                                        # | keys and values for tokens already emitted. Within one block
+        self.pending: dict[int, list] = {}                                                          # | of new tokens, which is the whole prompt during prefill or a
+                                                                                                    # | single token during decoding, every turn must read the same
+    def slot_of(self, step: int) -> int:                                                            # | committed state. When turn 3 was allowed to read what turn 1
+        return (step - 1) % self.budget if self.budget else step - 1                                # | had written during the same prefill, the prompt's own tokens
+                                                                                                    # | were attended to twice and a cached decode silently disagreed
+    def begin_block(self):                                                                          # | with the equivalent full-sequence forward. Reads now come from
+        self.pending = {}                                                                           # | committed, writes land in pending, and end_block publishes
+                                                                                                    # | them once the whole block is done.
     def read(self, step: int):
         return self.committed.get(self.slot_of(step))
 
@@ -126,27 +126,27 @@ class RecurrenceKVCache:
         self.pending = {}
 
 
-@torch.no_grad()
-def generate(model, prompt, max_new_tokens: int = 8, r: int = 8, kv_budget: int | None = None,
-             kl_threshold: float | None = None, r_max: int = 64, warm_start: bool = False,
-             greedy: bool = True, eos_id: int | None = None, generator=None):
+@torch.no_grad()                                                                                    # +-- DECODING, WITH BOTH ZERO-SHOT TRICKS WIRED IN --------------
+def generate(model, prompt, max_new_tokens: int = 8, r: int = 8, kv_budget: int | None = None,      # | One token at a time. The prelude runs on the new token and
+             kl_threshold: float | None = None, r_max: int = 64, warm_start: bool = False,          # | appends to its own cache; the core turns as many times as
+             greedy: bool = True, eos_id: int | None = None, generator=None):                       # | asked, or until the KL criterion says the distribution has
     """Cached decoding.  Supports Sec. 6.1 (kl_threshold), 6.2 (kv_budget) and
     6.3 (warm_start: carry s_r into the next token's s_0 instead of resampling).
 
     Returns the generated ids and, per generated token, the recurrence steps used.
     """
-    device = prompt.device
-    B = prompt.shape[0]
-    prelude_kv, coda_kv = None, None
-    core_cache = RecurrenceKVCache(len(model.core), kv_budget)
-    ids = prompt
-    steps_used, generated = [], []
-    carry = None
-    cur = prompt
-
-    for t in range(max_new_tokens + 1):
-        e, prelude_kv = model.prelude_forward(cur, prelude_kv)
-        if warm_start and carry is not None:
+    device = prompt.device                                                                          # | settled; the coda produces the logits. warm_start is the third
+    B = prompt.shape[0]                                                                             # | trick: instead of drawing a fresh random start state for each
+    prelude_kv, coda_kv = None, None                                                                # | new token, it carries the previous token's final state in as
+    core_cache = RecurrenceKVCache(len(model.core), kv_budget)                                      # | the new starting point, which chains the computation across
+    ids = prompt                                                                                    # | tokens and makes the effective depth larger than r without
+    steps_used, generated = [], []                                                                  # | running more turns. The KL probe calls the coda with the
+    carry = None                                                                                    # | committed cache, which is safe because coda_forward builds and
+    cur = prompt                                                                                    # | returns new cache tensors rather than modifying the ones
+                                                                                                    # | handed to it, so probing every turn leaves the real cache
+    for t in range(max_new_tokens + 1):                                                             # | untouched. steps_used records how many turns each generated
+        e, prelude_kv = model.prelude_forward(cur, prelude_kv)                                      # | token actually took, which is the number the adaptive-exit
+        if warm_start and carry is not None:                                                        # | claim is measured on.
             # Sec. 6.3: "warm-start with the last state sr from the previous token"
             s = carry[:, -1:].expand(-1, e.shape[1], -1).contiguous()
         else:

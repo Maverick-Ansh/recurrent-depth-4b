@@ -46,16 +46,16 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# ---------------------------------------------------------------- vocabulary
-PAD, BOS, EOS, SEP = 256, 257, 258, 259
-VOCAB_SIZE = 260
-
-PERM_BASE = 128                                    # 120 symbols -> bytes 128..247
-S5 = list(itertools.permutations(range(5)))        # 120 elements
-S5_INDEX = {p: i for i, p in enumerate(S5)}
-assert len(S5) == 120 and PERM_BASE + 120 <= 248
-
-
+# ---------------------------------------------------------------- vocabulary                       # +-- ONE BYTE VOCABULARY FOR EVERYTHING -------------------------
+PAD, BOS, EOS, SEP = 256, 257, 258, 259                                                             # | Tokens are raw bytes plus four control ids, so there is no
+VOCAB_SIZE = 260                                                                                    # | tokenizer file to train, version, or lose. The three tasks
+                                                                                                    # | share the single vocabulary, which means one model can be
+PERM_BASE = 128                                    # 120 symbols -> bytes 128..247                  # | trained on all of them at once and evaluated per task.
+S5 = list(itertools.permutations(range(5)))        # 120 elements                                   # | Permutations need their own symbols, and they are placed at
+S5_INDEX = {p: i for i, p in enumerate(S5)}                                                         # | 128 and above while every task that writes text stays inside
+assert len(S5) == 120 and PERM_BASE + 120 <= 248                                                    # | ASCII, so the two ranges can never be confused for one
+                                                                                                    # | another. compose is the group product, written so that
+                                                                                                    # | applying p after q means looking up q's output in p.
 def compose(p, q):
     """Group product (p . q)(i) = p(q(i))."""
     return tuple(p[q[i]] for i in range(5))
@@ -65,24 +65,24 @@ def encode(s: str) -> list[int]:
     return list(s.encode("ascii"))
 
 
-# ------------------------------------------------------------------- perm task
-# The word problem is stated over a FIXED GENERATING SET, and that is also what
-# makes it learnable at small scale: the model has to read only |GENERATORS|
-# distinct input symbols while tracking a 120-state automaton, rather than first
-# memorising a 120 x 120 multiplication table.  The hardness result is unchanged
-# -- S5 is the smallest non-solvable symmetric group, so its word problem over a
-# fixed generating set is NC^1-complete and a constant-depth (TC^0) transformer
-# cannot solve it for growing n unless TC^0 = NC^1.
-GENERATORS = [
-    (1, 0, 2, 3, 4),      # transposition (0 1)
-    (0, 2, 1, 3, 4),      # transposition (1 2)
-    (1, 2, 3, 4, 0),      # 5-cycle
-    (4, 0, 1, 2, 3),      # its inverse
-    (0, 1, 2, 3, 4),      # identity, so the answer is not a function of n alone
-]
-# |GENERATORS|^n distinct prompts exist at level n: 25 at n=2, 625 at n=4, 390k
-# at n=8, 1.5e11 at n=16. The two smallest levels are therefore memorisable by
-# table lookup, which `scripts/check_eval.py` measures per cell rather than
+# ------------------------------------------------------------------- perm task                     # +-- A WORD PROBLEM WITH A DEPTH KNOB ---------------------------
+# The word problem is stated over a FIXED GENERATING SET, and that is also what                     # | Each input symbol is one permutation of five elements, drawn
+# makes it learnable at small scale: the model has to read only |GENERATORS|                        # | from a fixed set of five generators, and the answer is what
+# distinct input symbols while tracking a 120-state automaton, rather than first                    # | you get by applying them all in order. There is no shortcut:
+# memorising a 120 x 120 multiplication table.  The hardness result is unchanged                    # | the running state after k symbols depends on all k of them,
+# -- S5 is the smallest non-solvable symmetric group, so its word problem over a                    # | and the group is non-abelian so they cannot be reordered or
+# fixed generating set is NC^1-complete and a constant-depth (TC^0) transformer                     # | grouped cheaply. S5 is the smallest symmetric group that is
+# cannot solve it for growing n unless TC^0 = NC^1.                                                 # | not solvable, which is what makes its word problem
+GENERATORS = [                                                                                      # | NC1-complete; a transformer of fixed depth computes only TC0
+    (1, 0, 2, 3, 4),      # transposition (0 1)                                                     # | functions, so it cannot solve this for growing n unless those
+    (0, 2, 1, 3, 4),      # transposition (1 2)                                                     # | two classes collapse. A model that can iterate can. Stating
+    (1, 2, 3, 4, 0),      # 5-cycle                                                                 # | the problem over a fixed generating set rather than over all
+    (4, 0, 1, 2, 3),      # its inverse                                                             # | 120 elements is both the theoretically standard form and the
+    (0, 1, 2, 3, 4),      # identity, so the answer is not a function of n alone                    # | practical fix: the model reads five distinct input symbols
+]                                                                                                   # | instead of 120, so it does not have to memorise a
+# There are len(GENERATORS)**n distinct prompts at level n: 25 at n=2, 625 at n=4, 390k             # | multiplication table before it can start composing. n is the
+# at n=8, 1.5e11 at n=16. The two smallest levels are therefore memorisable by                      # | difficulty knob and it is exactly the number of sequential
+# table lookup, which `scripts/check_eval.py` measures per cell rather than                         # | steps the answer requires.
 # hiding -- they are the easy end of the difficulty axis and the claim is carried
 # by n >= 8, where memorisation is not available.
 
@@ -98,18 +98,18 @@ def make_perm(rng: random.Random, n: int) -> tuple[list[int], list[int]]:
     return prompt, answer
 
 
-# -------------------------------------------------------------------- add task
-def make_add(rng: random.Random, n_operands: int, n_digits: int):
-    """Paper App. A.1 formulation, compressed to 'a+b+c=' with no chat template."""
-    lo, hi = (0, 9) if n_digits == 1 else (10 ** (n_digits - 1), 10 ** n_digits - 1)
-    xs = [rng.randint(lo, hi) for _ in range(n_operands)]
-    prompt = encode("+".join(str(x) for x in xs) + "=")
-    answer = encode(str(sum(xs)))
-    return prompt, answer
-
-
-# ----------------------------------------------------------------- recall task
-def make_recall(rng: random.Random, n_pairs: int):
+# -------------------------------------------------------------------- add task                     # +-- ADDITION, AND THE CONTROL THAT MUST NOT IMPROVE ------------
+def make_add(rng: random.Random, n_operands: int, n_digits: int):                                   # | Addition is the paper's own study, and it has two knobs: more
+    """Paper App. A.1 formulation, compressed to 'a+b+c=' with no chat template."""                 # | operands means more carries chained together, more digits
+    lo, hi = (0, 9) if n_digits == 1 else (10 ** (n_digits - 1), 10 ** n_digits - 1)                # | means longer carries. recall is the control, and the suite
+    xs = [rng.randint(lo, hi) for _ in range(n_operands)]                                           # | would prove nothing without it. It asks the model to find one
+    prompt = encode("+".join(str(x) for x in xs) + "=")                                             # | key among many and report its value, which needs attention and
+    answer = encode(str(sum(xs)))                                                                   # | memory but no sequential computation at all: one induction
+    return prompt, answer                                                                           # | head does it in a single pass, and adding depth should buy
+                                                                                                    # | nothing. If extra recurrence improved every task equally, the
+                                                                                                    # | claim being tested would be unfalsifiable, because everything
+# ----------------------------------------------------------------- recall task                     # | improves with training. The prediction being checked is that
+def make_recall(rng: random.Random, n_pairs: int):                                                  # | recurrence helps perm and add and not recall.
     """'k1:v1 k2:v2 ... ?kq=' -> vq.   Single hop: memory-hard, depth-easy."""
     letters = "abcdefghijklmnopqrstuvwxyz"
     keys = rng.sample([a + b for a in letters for b in letters], n_pairs)
@@ -121,23 +121,23 @@ def make_recall(rng: random.Random, n_pairs: int):
     return prompt, answer
 
 
-# ---------------------------------------------------------------- difficulties
-# Each entry is (kwargs, difficulty_label).  `difficulty` orders tasks by the
-# sequential depth we believe they require -- the axis C1 predicts saturation
-# should track.
-PERM_LEVELS = [2, 4, 8, 16, 24]
-ADD_LEVELS = [(2, 1), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (3, 3), (4, 2)]
-RECALL_LEVELS = [4, 8, 16, 24]
-
-TASKS = ("perm", "add", "recall")
-
-# How many distinct prompts a cell can produce.  A cell whose space is small
-# compared to the training stream will be covered exhaustively, so a model can
-# score on it by table lookup instead of by computing -- which is a legitimate
-# easy end of the difficulty axis, but cannot carry a claim about reasoning.
-# We compute this rather than assume it, and `scripts/check_eval.py` prints it
-# so every number in the report can be read as "computed" or "possibly recalled".
-TABULABLE_THRESHOLD = 1_000_000
+# ---------------------------------------------------------------- difficulties                     # +-- WHICH CELLS CAN BE MEMORISED, COMPUTED NOT ASSUMED ---------
+# Each entry is (kwargs, difficulty_label).  `difficulty` orders tasks by the                       # | A cell whose set of possible prompts is small enough gets
+# sequential depth we believe they require -- the axis C1 predicts saturation                       # | covered completely by the training stream, and a model can
+# should track.                                                                                     # | then score on it by looking the answer up rather than working
+PERM_LEVELS = [2, 4, 8, 16, 24]                                                                     # | it out. That is not a flaw to hide; it is the easy end of the
+ADD_LEVELS = [(2, 1), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (3, 3), (4, 2)]                       # | difficulty axis, and it is exactly where the claim predicts
+RECALL_LEVELS = [4, 8, 16, 24]                                                                      # | saturation at small r. But it cannot carry a claim about
+                                                                                                    # | reasoning, so which cells are which is computed from the size
+TASKS = ("perm", "add", "recall")                                                                   # | of the prompt space rather than guessed. Five generators give
+                                                                                                    # | 25 possible prompts at n=2 and 1.5e11 at n=16; two single
+# How many distinct prompts a cell can produce.  A cell whose space is small                        # | digits give 100 and three three-digit numbers give 7.3e8;
+# compared to the training stream will be covered exhaustively, so a model can                      # | recall's key sets are unbounded. The gate script then measures
+# score on it by table lookup instead of by computing -- which is a legitimate                      # | the actual overlap between eval prompts and a training stream,
+# easy end of the difficulty axis, but cannot carry a claim about reasoning.                        # | and the measured leak matches the computed space closely: 1.00
+# We compute this rather than assume it, and `scripts/check_eval.py` prints it                      # | at 25 prompts, 0.73 at 1e3, and 0.00 above 1e6. Eight of
+# so every number in the report can be read as "computed" or "possibly recalled".                   # | seventeen cells survive as places where a score has to be
+TABULABLE_THRESHOLD = 1_000_000                                                                     # | computed.
 
 
 def prompt_space(task: str, level) -> float:
@@ -175,29 +175,29 @@ def levels_for(task: str):
     return {"perm": PERM_LEVELS, "add": ADD_LEVELS, "recall": RECALL_LEVELS}[task]
 
 
-# ------------------------------------------------------------------- packing
-@dataclass
-class Corpus:
-    tokens: np.ndarray          # 1-D uint16 stream, ready for packing into blocks
-    n_examples: int
-
-
-def build_train_corpus(n_tokens: int, seed: int = 0, text: np.ndarray | None = None,
-                       text_frac: float = 0.30, task_weights=(0.40, 0.35, 0.25)) -> Corpus:
+# ------------------------------------------------------------------- packing                       # +-- PACKING, HELD-OUT SETS, AND EVERY CELL'S FLOOR -------------
+@dataclass                                                                                          # | Examples are concatenated into one continuous byte stream and
+class Corpus:                                                                                       # | random windows are cut from it, which is what the paper does
+    tokens: np.ndarray          # 1-D uint16 stream, ready for packing into blocks                  # | with its own corpus. The model therefore sees answers only as
+    n_examples: int                                                                                 # | ordinary continuations, never flagged as targets, and the loss
+                                                                                                    # | is plain next byte prediction over everything. Held-out sets
+                                                                                                    # | are generated from a different seed, so they are drawn from
+def build_train_corpus(n_tokens: int, seed: int = 0, text: np.ndarray | None = None,                # | the same distribution but are not the same items.
+                       text_frac: float = 0.30, task_weights=(0.40, 0.35, 0.25)) -> Corpus:         # | shortcut_baseline is the number that keeps the results honest:
     """Build one packed byte stream, mixing the three tasks (and optional text).
 
     Sec. 4.1: the paper packs tokenised documents into fixed-length sequences and
     trains a plain next-token loss over everything; we do the same, so the model
     sees the answers only as ordinary continuations, never as a special target.
     """
-    rng = random.Random(seed)
-    out: list[int] = []
-    n_ex = 0
-    n_task_tokens = int(n_tokens * (1.0 - (text_frac if text is not None else 0.0)))
-    while len(out) < n_task_tokens:
-        task = rng.choices(TASKS, weights=task_weights)[0]
-        level = rng.choice(levels_for(task))
-        prompt, answer = sample_example(rng, task, level)
+    rng = random.Random(seed)                                                                       # | it is what an unconditional guesser scores by always answering
+    out: list[int] = []                                                                             # | with the most common answer for that cell. Reporting an
+    n_ex = 0                                                                                        # | accuracy without it invites reading a number near zero as a
+    n_task_tokens = int(n_tokens * (1.0 - (text_frac if text is not None else 0.0)))                # | failure when it is actually the ceiling of the trivial policy,
+    while len(out) < n_task_tokens:                                                                 # | or a number well above zero as success when the constant guess
+        task = rng.choices(TASKS, weights=task_weights)[0]                                          # | already gets there. Measured floors here run from 0.004 to
+        level = rng.choice(levels_for(task))                                                        # | 0.199 depending on the cell, so no single baseline would have
+        prompt, answer = sample_example(rng, task, level)                                           # | done.
         out.extend([BOS] + prompt + answer + [EOS])
         n_ex += 1
     if text is not None and text_frac > 0:

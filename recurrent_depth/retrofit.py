@@ -68,53 +68,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def chunked_cross_entropy(logits, targets, chunk: int = 64, ignore_index: int = -100):
+def chunked_cross_entropy(logits, targets, chunk: int = 64, ignore_index: int = -100):              # +-- LOSS WITHOUT A 300 MB FLOAT32 COPY -------------------------
     """Cross entropy without materialising an fp32 (B, T, 151936) tensor.
 
     Qwen's vocabulary is 151936, so at B=2, T=256 the fp32 upcast of the logits
     alone is 300 MB and it is what pushed a 15.6 GB T4 over the edge. Summing
     the loss over sequence chunks keeps only one chunk upcast at a time.
     """
-    B, T, V = logits.shape
-    total = logits.new_zeros((), dtype=torch.float32)
-    n = 0
-    for i in range(0, T, chunk):
-        lg = logits[:, i:i + chunk].reshape(-1, V)
-        tg = targets[:, i:i + chunk].reshape(-1)
-        cnt = int((tg != ignore_index).sum())
-        if cnt == 0:
-            continue
-        total = total + F.cross_entropy(lg.float(), tg, ignore_index=ignore_index,
+    B, T, V = logits.shape                                                                          # | Cross entropy needs float32 to be numerically safe, but Qwen's
+    total = logits.new_zeros((), dtype=torch.float32)                                               # | vocabulary is 151936 entries wide, so upcasting the whole
+    n = 0                                                                                           # | logit tensor at batch 2 and length 256 allocates 300 MB in one
+    for i in range(0, T, chunk):                                                                    # | go. That single allocation is what pushed a 15.6 GB T4 over
+        lg = logits[:, i:i + chunk].reshape(-1, V)                                                  # | its limit. Summing the loss over slices of the sequence keeps
+        tg = targets[:, i:i + chunk].reshape(-1)                                                    # | only one slice upcast at a time and gives the identical
+        cnt = int((tg != ignore_index).sum())                                                       # | number, because cross entropy summed over positions and then
+        if cnt == 0:                                                                                # | divided by the count is exactly the mean. Positions marked
+            continue                                                                                # | ignore_index are excluded from both the sum and the count, so
+        total = total + F.cross_entropy(lg.float(), tg, ignore_index=ignore_index,                  # | padded batches do not shift the average.
                                         reduction="sum")
         n += cnt
     return total / max(n, 1)
 
 
-# ------------------------------------------------------------------ minimal LoRA
-class LoRALinear(nn.Module):
+# ------------------------------------------------------------------ minimal LoRA                   # +-- LOW-RANK UPDATE, SHARED ACROSS ALL TURNS -------------------
+class LoRALinear(nn.Module):                                                                        # | The frozen weight stays; a small correction is added on top,
     """y = W x + (alpha/rank) * B(A x).  W frozen, A/B trained.
 
     Written out rather than imported so that the weight sharing is unambiguous:
     the core block's LoRA parameters are the SAME tensors at every recurrence
     step, which is what makes this a recurrent model rather than a deep one.
     """
-
-    def __init__(self, base: nn.Linear, rank: int = 16, alpha: int = 32, dropout: float = 0.0):
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad_(False)
-        self.rank, self.scale = rank, alpha / rank
-        # Trainable params are fp32 while the frozen base stays fp16: a
-        # GradScaler refuses to unscale fp16 gradients, so the master copy of
-        # anything we optimise has to be fp32. The rank-r factors are tiny, so
-        # casting them to the activation dtype per call costs nothing.
-        dv = base.weight.device
+                                                                                                    # | built from two thin matrices whose product has rank at most
+    def __init__(self, base: nn.Linear, rank: int = 16, alpha: int = 32, dropout: float = 0.0):     # | 16. lora_B starts at zero, so at step zero the correction is
+        super().__init__()                                                                          # | exactly zero and the model is bit-for-bit the pretrained one.
+        self.base = base                                                                            # | These parameters are float32 while the base model is float16,
+        for p in self.base.parameters():                                                            # | because the gradient scaler used for mixed precision refuses
+            p.requires_grad_(False)                                                                 # | to unscale float16 gradients, so anything being optimised
+        self.rank, self.scale = rank, alpha / rank                                                  # | needs a float32 master copy. Casting them to the activation
+        # Trainable params are fp32 while the frozen base stays fp16: a                             # | dtype on each call is free at this size. The reason this
+        # GradScaler refuses to unscale fp16 gradients, so the master copy of                       # | matters more here than in ordinary fine-tuning: these are the
+        # anything we optimise has to be fp32. The rank-r factors are tiny, so                      # | same tensors on every turn of the loop, so a rank-16 update
+        # casting them to the activation dtype per call costs nothing.                              # | learned once is applied r times. That weight sharing is what
+        dv = base.weight.device                                                                     # | makes this a recurrent model rather than a deep one.
         self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=torch.float32, device=dv))
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32, device=dv))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))   # B stays zero: dW = 0 at init
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))   # B stays zero: dW = 0 at init      # | inject_lora walks the module tree and swaps matching linear
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()                        # | layers in place, without recursing into the ones it has just
+                                                                                                    # | replaced.
     def forward(self, x):
         h = self.dropout(x)
         h = F.linear(h, self.lora_A.to(h.dtype))
@@ -133,25 +133,25 @@ def inject_lora(module: nn.Module, targets, rank=16, alpha=32, dropout=0.0) -> i
     return n
 
 
-# ------------------------------------------------------------------ the retrofit
-class RecurrentDepthRetrofit(nn.Module):
-    ATTN_MLP = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
-
-    def __init__(self, hf_model, l_prelude: int, l_core: int, l_coda: int,
-                 injection: str = "concat", adapter_init: str = "identity",
-                 core_norm: bool = True, backprop_depth: int = 2, random_s0: bool = True,
-                 grad_checkpoint: bool = True):
-        super().__init__()
-        self.hf = hf_model
-        inner = hf_model.model
-        L = len(inner.layers)
-        assert l_prelude + l_core + l_coda <= L, f"{l_prelude}+{l_core}+{l_coda} > {L}"
-        self.lP, self.lR, self.lC = l_prelude, l_core, l_coda
-        self.h = hf_model.config.hidden_size
-        self.injection, self.backprop_depth, self.random_s0 = injection, backprop_depth, random_s0
-        self.grad_checkpoint = grad_checkpoint
-
-        self.embed_tokens = inner.embed_tokens
+# ------------------------------------------------------------------ the retrofit                   # +-- CUTTING A 36-LAYER MODEL INTO THREE PIECES -----------------
+class RecurrentDepthRetrofit(nn.Module):                                                            # | Nothing is copied or rebuilt. The pretrained layer list is
+    ATTN_MLP = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")        # | sliced into three views: the first lP layers become the
+                                                                                                    # | prelude, the next lR become the core that will be looped, the
+    def __init__(self, hf_model, l_prelude: int, l_core: int, l_coda: int,                          # | rest become the coda. The embedding, the final norm and the
+                 injection: str = "concat", adapter_init: str = "identity",                         # | output head are reused as they are, and every pretrained
+                 core_norm: bool = True, backprop_depth: int = 2, random_s0: bool = True,           # | weight is frozen. The only new tensors are the adapter and the
+                 grad_checkpoint: bool = True):                                                     # | core norm. How the adapter starts is the whole experiment.
+        super().__init__()                                                                          # | identity sets the state half to zero and the embedding half to
+        self.hf = hf_model                                                                          # | the identity matrix, so the adapter returns e and ignores the
+        inner = hf_model.model                                                                      # | state: at r=1 the model computes exactly what the original
+        L = len(inner.layers)                                                                       # | network computed, and the recurrence does nothing at all until
+        assert l_prelude + l_core + l_coda <= L, f"{l_prelude}+{l_core}+{l_coda} > {L}"             # | training teaches it to. That is a deliberate choice to begin
+        self.lP, self.lR, self.lC = l_prelude, l_core, l_coda                                       # | inside the failure the paper describes for its second failed
+        self.h = hf_model.config.hidden_size                                                        # | run, where the model learned early to ignore the incoming
+        self.injection, self.backprop_depth, self.random_s0 = injection, backprop_depth, random_s0  # | state. paper initialises both halves at random, which is
+        self.grad_checkpoint = grad_checkpoint                                                      # | faithful but starts from a destroyed model: measured, its loss
+                                                                                                    # | before training is 11.3 against the base model's 0.71. sum is
+        self.embed_tokens = inner.embed_tokens                                                      # | the cheaper addition variant.
         self.rotary = inner.rotary_emb
         self.prelude = inner.layers[:l_prelude]
         self.core = inner.layers[l_prelude:l_prelude + l_core]
@@ -191,19 +191,19 @@ class RecurrentDepthRetrofit(nn.Module):
         self.adapter_init = mode
 
     # ------------------------------------------------------------------ pieces
-    def _rope(self, x, position_ids):
-        return self.rotary(x, position_ids)
-
-    def _run(self, layers, x, pos, rope):
-        for lyr in layers:
-            x = lyr(x, attention_mask=None, position_ids=pos, position_embeddings=rope)
-            if isinstance(x, tuple):
-                x = x[0]
-        return x
-
-    def prelude_forward(self, idx):
-        x = self.embed_tokens(idx)
-        pos = torch.arange(idx.shape[1], device=idx.device).unsqueeze(0)
+    def _rope(self, x, position_ids):                                                               # +-- RUNNING THE PIECES, AND THE ADAPTER ------------------------
+        return self.rotary(x, position_ids)                                                         # | _run drives a slice of pretrained layers. It passes the rotary
+                                                                                                    # | tables in explicitly rather than letting the model build them,
+    def _run(self, layers, x, pos, rope):                                                           # | because the core is being called many times over the same
+        for lyr in layers:                                                                          # | positions and rebuilding would be wasted work. The layers
+            x = lyr(x, attention_mask=None, position_ids=pos, position_embeddings=rope)             # | return a bare tensor in current transformers versions and a
+            if isinstance(x, tuple):                                                                # | tuple in older ones, so both are handled. prelude_forward
+                x = x[0]                                                                            # | computes e once. inject is the adapter, and it casts the
+        return x                                                                                    # | float32 adapter matrix down to the activation dtype rather
+                                                                                                    # | than casting the activations up, because the activations are
+    def prelude_forward(self, idx):                                                                 # | the large tensor. core_forward is one turn. init_state draws
+        x = self.embed_tokens(idx)                                                                  # | the start state at the calibrated scale, or returns zeros if
+        pos = torch.arange(idx.shape[1], device=idx.device).unsqueeze(0)                            # | the random start is being ablated.
         rope = self._rope(x, pos)
         return self._run(self.prelude, x, pos, rope), pos, rope
 
@@ -232,19 +232,19 @@ class RecurrentDepthRetrofit(nn.Module):
         return t.to(e.dtype)
 
     # ----------------------------------------------------------------- forward
-    def forward(self, idx, r: int, targets=None, k: int | None = None, s0=None,
-                generator=None, return_states: bool = False, ignore_index: int = -100):
-        k = self.backprop_depth if k is None else k
-        k = max(1, min(k, r))
-        e, pos, rope = self.prelude_forward(idx)
-        s = self.init_state(e, generator) if s0 is None else s0
-        states = [s] if return_states else None
-
-        if r - k > 0:
-            with torch.no_grad():
-                for _ in range(r - k):
-                    s = self.core_forward(s, e, pos, rope)
-                    if return_states:
+    def forward(self, idx, r: int, targets=None, k: int | None = None, s0=None,                     # +-- THE SAME TRUNCATED OBJECTIVE, PLUS CHECKPOINTING -----------
+                generator=None, return_states: bool = False, ignore_index: int = -100):             # | Identical to the from-scratch model: the first r minus k turns
+        k = self.backprop_depth if k is None else k                                                 # | run without gradients and the state is detached, only the last
+        k = max(1, min(k, r))                                                                       # | k turns are differentiated. The addition here is that each
+        e, pos, rope = self.prelude_forward(idx)                                                    # | differentiated turn is wrapped in a checkpoint, so its
+        s = self.init_state(e, generator) if s0 is None else s0                                     # | intermediate activations are thrown away during the forward
+        states = [s] if return_states else None                                                     # | pass and recomputed during the backward one. Without it, k=2
+                                                                                                    # | turns of 18 pretrained layers each, at hidden size 2560, does
+        if r - k > 0:                                                                               # | not fit alongside 8 GB of frozen weights. With it, peak memory
+            with torch.no_grad():                                                                   # | is one turn's worth: measured at 10.22 GB, and identical
+                for _ in range(r - k):                                                              # | whether r is 4 or 8. Checkpointing is skipped when states are
+                    s = self.core_forward(s, e, pos, rope)                                          # | being collected, because recomputation would produce a second
+                    if return_states:                                                               # | set of them.
                         states.append(s)
             s = s.detach()
         for _ in range(k):
@@ -273,27 +273,27 @@ class RecurrentDepthRetrofit(nn.Module):
         return self.forward(idx, r, s0=s0, generator=generator, return_states=True)["states"]
 
     # --------------------------------------------------------------- calibrate
-    @torch.no_grad()
-    def calibrate(self, idx) -> dict:
+    @torch.no_grad()                                                                                # +-- MEASURE THE MODEL, DO NOT ASSUME ITS SCALES ----------------
+    def calibrate(self, idx) -> dict:                                                               # | The paper fixes the start state's variance at 2/5 and that
         """Measure the base model's own scales at the cut point and match them.
 
         Sets sigma_s to RMS(e) and core_norm.weight to RMS(h_{lP+lR}), so that
         with the identity adapter the r=1 retrofit reproduces the base model
         instead of feeding the coda activations at an unfamiliar scale.
         """
-        e, pos, rope = self.prelude_forward(idx)
-        rms_e = e.float().pow(2).mean().sqrt().item()
-        h_core = self._run(self.core, e, pos, rope)         # what the coda normally receives
-        rms_core = h_core.float().pow(2).mean().sqrt().item()
-        self.sigma_s = rms_e
-        if self.core_norm is not None:
-            self.core_norm.weight.fill_(rms_core)
-        return {"rms_e": rms_e, "rms_core_out": rms_core, "sigma_s": self.sigma_s}
-
-    # ---------------------------------------------------------------- training
-    def add_lora(self, rank=16, alpha=32, dropout=0.0, where=("core",)) -> int:
-        n = 0
-        for part in where:
+        e, pos, rope = self.prelude_forward(idx)                                                    # | number is correct for its own model, where the embedding is
+        rms_e = e.float().pow(2).mean().sqrt().item()                                               # | initialised at variance 2/(5h) and scaled by sqrt(h). Qwen was
+        h_core = self._run(self.core, e, pos, rope)         # what the coda normally receives       # | trained differently and its activations live somewhere else
+        rms_core = h_core.float().pow(2).mean().sqrt().item()                                       # | entirely: measured here, e has RMS 6.66 and what the coda
+        self.sigma_s = rms_e                                                                        # | expects to receive has RMS 10.08. Copying the paper's constant
+        if self.core_norm is not None:                                                              # | would have fed the coda vectors about sixteen times too small.
+            self.core_norm.weight.fill_(rms_core)                                                   # | So calibrate runs the base model once, reads both scales off
+        return {"rms_e": rms_e, "rms_core_out": rms_core, "sigma_s": self.sigma_s}                  # | it, and sets the start state and the core norm's weight to
+                                                                                                    # | match. That makes the new norm close to a no-op at r=1 while
+    # ---------------------------------------------------------------- training                     # | still bounding the state when the loop runs long.
+    def add_lora(self, rank=16, alpha=32, dropout=0.0, where=("core",)) -> int:                     # | mark_trainable turns on exactly the tensors that must learn:
+        n = 0                                                                                       # | the adapter, the core norm, and the low-rank factors, which
+        for part in where:                                                                          # | came to 29.6M of 4.05B, or 0.73 percent.
             n += inject_lora(getattr(self, part), self.ATTN_MLP, rank, alpha, dropout)
         return n
 
@@ -318,16 +318,16 @@ class RecurrentDepthRetrofit(nn.Module):
         return tot - core + r * core
 
 
-class _RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        dt = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+class _RMSNorm(nn.Module):                                                                          # +-- BUILD ORDER MATTERS ----------------------------------------
+    def __init__(self, dim, eps=1e-6):                                                              # | The retrofit's own modules are created after the pretrained
+        super().__init__()                                                                          # | model has already been moved to the GPU, so they start life on
+        self.weight = nn.Parameter(torch.ones(dim))                                                 # | the CPU and the whole object has to be moved again. Forgetting
+        self.eps = eps                                                                              # | that second move is a silent construction-time error that only
+                                                                                                    # | surfaces as a device mismatch deep inside a matrix multiply.
+    def forward(self, x):                                                                           # | materialized_params above counts the same thing as in the
+        dt = x.dtype                                                                                # | from-scratch model: total weights minus the core, plus the
+        x = x.float()                                                                               # | core counted r times. For this split it reads 4.05B at r=1,
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)                             # | 16.98B at r=8 and 61.29B at r=32.
         return (x * self.weight.float()).to(dt)
 
 
