@@ -55,10 +55,14 @@ def sample_s0(shape, device, dtype, sigma_s: float = math.sqrt(0.4),
     """
     if deterministic:
         return torch.zeros(shape, device=device, dtype=dtype)
-    t = torch.empty(shape, device=device, dtype=torch.float32)
     if generator is not None:
-        # trunc_normal_ takes no generator; sample via rejection-free clamp of a seeded normal.
+        # trunc_normal_ takes no generator; sample via a clamped seeded normal.
+        # torch requires the generator and the tensor to share a device, so sample
+        # on the generator's device and move -- callers should not have to care.
+        t = torch.empty(shape, device=generator.device, dtype=torch.float32)
         t.normal_(0.0, sigma_s, generator=generator).clamp_(-3 * sigma_s, 3 * sigma_s)
+        t = t.to(device)
     else:
+        t = torch.empty(shape, device=device, dtype=torch.float32)
         truncated_normal_(t, sigma_s)
     return t.to(dtype)

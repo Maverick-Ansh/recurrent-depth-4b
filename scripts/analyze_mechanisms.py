@@ -70,7 +70,7 @@ def kv_sharing_accuracy(m, items, r, budget, device, n=64):
         p = torch.tensor([prompt], device=device)
         with torch.autocast("cuda", dtype=torch.float16):
             g = generate(m, p, max_new_tokens=len(answer), r=r, kv_budget=budget,
-                         generator=torch.Generator(device="cpu").manual_seed(0))
+                         generator=torch.Generator(device=device).manual_seed(0))
         ok += int(g["generated"][0].tolist() == answer)
     return ok / min(n, len(items))
 
