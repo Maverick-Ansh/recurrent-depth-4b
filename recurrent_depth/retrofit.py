@@ -300,4 +300,5 @@ def build_retrofit(model_id="Qwen/Qwen3-4B-Base", split=(9, 18, 9), adapter_init
     hf.to(device).eval()
     m = RecurrentDepthRetrofit(hf, *split, injection=injection, adapter_init=adapter_init,
                                core_norm=core_norm, backprop_depth=backprop_depth)
+    m.to(device)          # the adapter and core_norm are new modules, still on CPU
     return m, tok
