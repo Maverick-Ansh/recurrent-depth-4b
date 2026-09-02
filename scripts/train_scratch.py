@@ -188,14 +188,15 @@ def main():
         if it % 50 == 0 or it == steps - 1:
             with torch.no_grad():
                 tc = token_correlation(out["state"].detach().float())
-            hist["step"].append(it); hist["loss"].append(float(loss))
+            lv = loss.detach().item()
+            hist["step"].append(it); hist["loss"].append(lv)
             hist["r"].append(r); hist["token_corr"].append(tc)
             hist["rel_step"].append(float("nan")); hist["lr"].append(lr_at(it))
             if it % 500 == 0:
                 el = time.time() - t0
-                print(f"[{tag}] it {it:5d}/{steps}  loss {float(loss):.4f}  r={r:2d}  "
+                print(f"[{tag}] it {it:5d}/{steps}  loss {lv:.4f}  r={r:2d}  "
                       f"tok_corr {tc:+.3f}  {el:.0f}s", flush=True)
-                if not math.isfinite(float(loss)):
+                if not math.isfinite(lv):
                     print(f"[{tag}] DIVERGED at it {it}", flush=True)
                     break
 
