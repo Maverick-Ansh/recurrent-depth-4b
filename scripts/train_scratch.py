@@ -77,12 +77,23 @@ ARMS = {
 }
 
 
-def build_data(cfg_tokens: int, seed: int, text_path: str | None, text_frac: float):
-    text = None
-    if text_path and os.path.exists(text_path):
-        text = np.load(text_path)
+def build_data(cfg_tokens: int, seed: int, text_path: str | None, text_frac: float,
+               cache_dir: str = "data_cache"):
+    """Generate the byte corpus once per (size, seed, text) and cache it.
+
+    Building it is a pure-Python loop over ~1M examples; every arm draws from the
+    SAME stream, so caching is both faster and a stronger control -- the arms
+    differ only in architecture and objective, never in the data they saw.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    stem = f"{cache_dir}/trackA_{cfg_tokens}_{seed}_{'t' if text_path else 'n'}{text_frac}"
+    tr_p, va_p = stem + "_train.npy", stem + "_val.npy"
+    if os.path.exists(tr_p) and os.path.exists(va_p):
+        return np.load(tr_p), np.load(va_p)
+    text = np.load(text_path) if (text_path and os.path.exists(text_path)) else None
     tr = tasks.build_train_corpus(cfg_tokens, seed=seed, text=text, text_frac=text_frac)
     va = tasks.build_train_corpus(300_000, seed=10_000 + seed, text=text, text_frac=text_frac)
+    np.save(tr_p, tr.tokens); np.save(va_p, va.tokens)
     return tr.tokens, va.tokens
 
 
@@ -108,7 +119,7 @@ def main():
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--rbar", type=float, default=8.0)
     p.add_argument("--k", type=int, default=4)
-    p.add_argument("--train-tokens", type=int, default=40_000_000)
+    p.add_argument("--train-tokens", type=int, default=25_000_000)
     p.add_argument("--text", type=str, default="")
     p.add_argument("--text-frac", type=float, default=0.25)
     p.add_argument("--eval-every", type=int, default=500)
