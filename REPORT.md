@@ -378,11 +378,60 @@ single-cell difference below roughly 0.10 is inside the seed spread and is not
 reported as a result. The `add` r-curve (0.23 → 0.62) and the flat `recall`
 control are both far outside it.
 
-### 5.5 Track B: the 4B retrofit
+### 5.5 Track B: the 4B retrofit — interim, and the sign is wrong
 
-*Training in progress: `retro_identity` and `retro_paper`, 1000 steps each at
-r̄ = 4, k = 2, batch 2 × accum 2 × 256 tokens ≈ 1.0M tokens per arm, LoRA rank 16
-on the core plus the adapter and n_c (29.6M trainable of 4.05B).*
+**This run was stopped at step 200 of 1000 (~200k of the intended 1.0M tokens)
+when the session ended. Everything below is a 20%-complete result and is
+reported as such.** It is recorded rather than discarded because the direction is
+unambiguous and it is the only direct evidence we have on C8.
+
+`retro_identity`: Qwen3-4B-Base cut to (9, 18, 9), `A = [0 | I]`, r̄ = 4, k = 2,
+LoRA rank 16 on the core plus the adapter and n_c — 29.6M trainable of 4.05B
+(0.73%). Held-out loss over 24 fixed val blocks, the same text at every depth:
+
+| r | 1 | 2 | 4 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|
+| val loss @ step 200 | **2.624** | 2.735 | 2.758 | 2.763 | 2.762 | 2.763 | 2.763 |
+
+**More recurrence makes the model worse, monotonically**, and the curve is flat
+from r=4 onward — the same fixed-point signature as Track A, reached at the same
+depth. Training is doing something: the loss at r=1 has moved, gradient norm fell
+from 20.9 to 13.5, and token correlation sits between 0.37 and 0.53 (healthy — not
+the 1.0 of representational collapse). But what it learned in 200k tokens is to
+improve the *single-pass* path, not to use the loop.
+
+Read against the bracket established in §5.1, this is the expected shape of the
+failure and not a surprise. The identity adapter starts the model exactly inside
+the basin §4.3 describes for the paper's second failed run — *"the model has
+learned early to ignore the incoming state s, preventing further improvements"*.
+At initialisation the r-curve is flat by construction. What we can say at 200
+steps is that it has not yet left that basin, and has tilted slightly the wrong
+way; what we cannot say is whether 1.0M tokens, or 800B, would change that.
+
+**What would distinguish the possible explanations**, none of which this run
+separates:
+
+1. *Not enough training.* 200k tokens against the paper's 800B. The cheapest test
+   is simply finishing the 1000-step run.
+2. *The basin.* If `--adapter-init identity_eps0.05` (state coupling weak rather
+   than exactly zero) produces a downward slope where `identity` does not, the
+   zero initialisation is the problem, not the idea.
+3. *LoRA is too weak a lever.* 0.73% of parameters, rank 16, on a core that must
+   learn to accept a fundamentally new input — a state vector it was never
+   trained to receive. Full fine-tuning of the core would test this and does not
+   fit on a T4.
+4. *Recurrence cannot be retrofitted this cheaply at all.* The honest null, and
+   the one the paper's own framing would predict, since it pretrained for
+   recurrence from scratch rather than installing it afterwards.
+
+**Verdict on C8 at this budget: untestable, leaning negative.** The instrument is
+sound — the surgery is bit-exact (§5.1) and the measurement is a like-for-like
+loss over identical text — so the number means what it says. But 200k tokens is
+not a fair test of a claim about what a model can learn, and calling this a
+refutation of C8 would be exactly the error of reading "we could not detect it"
+as "it is not there." See `RESUME.md` for the ordered commands to finish it.
+
+`retro_paper` (the faithful random-adapter contrast) never started.
 
 ---
 

@@ -39,8 +39,11 @@ of it is to skip recomputation.
   `noinject`, `prenorm`, `dets0`, `hi_lr`, `fullbp`) was running and did **not**
   finish.
 - **Track B**: the surgery gate passed and its numbers are in `REPORT.md` §5.1.
-  The `retro_identity` training run reached roughly step 50 of 1000 and did not
-  finish, so there is no retrofit checkpoint and no trained r-curve yet.
+  The `retro_identity` run reached step 200 of 1000 before the session ended and
+  produced one val-loss-vs-r curve, recorded in `REPORT.md` §5.5. It is a
+  negative interim result -- loss *rises* with r (2.624 at r=1 to 2.763 at r=16)
+  and flattens by r=4 -- but at 200k of 1.0M intended tokens it is not yet a fair
+  test. No checkpoint was written. `retro_paper` never started.
 
 `train_scratch.py` and `train_retrofit.py` both skip a run whose result json
 already exists, so a partially-completed sweep resumes rather than restarting.
@@ -100,12 +103,14 @@ is regenerable in an hour anyway.
 ## The two open questions, stated so they can be picked up cold
 
 1. **Does the identity-initialised retrofit escape the "ignore s" basin?**
-   Before training, the 4B retrofit's loss is flat across every r by construction
-   (`A = [0 | I]` makes the adapter return `e` and discard the state). The
-   question is whether ~1M tokens of random-r training gives it a slope. The
-   contrast arm is `--adapter-init paper`, which starts at loss 11.32 against the
-   base model's 0.71. A third option, `--adapter-init identity_eps0.05`, starts
-   the state coupling weak rather than absent and is untested.
+   At 200 of 1000 steps the answer is no, and the slope is slightly the wrong way
+   (`REPORT.md` §5.5). Four explanations are still open and the report lists what
+   separates them: too little training, the zero-initialised basin, LoRA being too
+   weak a lever at 0.73% of parameters, or recurrence genuinely not being
+   retrofittable this cheaply. Finishing the 1000-step run costs ~50 more minutes
+   and settles the first. Running `--adapter-init identity_eps0.05` settles the
+   second. The faithful contrast `--adapter-init paper` starts at loss 11.32
+   against the base model's 0.71 and never ran.
 
 2. **Would a task the model cannot solve at low depth stop it collapsing to a
    contraction?** Track A's model reaches its fixed point in about five turns
