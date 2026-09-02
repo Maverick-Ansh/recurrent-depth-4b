@@ -55,14 +55,17 @@ already exists, so a partially-completed sweep resumes rather than restarting.
 git clone https://github.com/Maverick-Ansh/recurrent-depth-4b && cd recurrent-depth-4b
 python scripts/smoke.py && python scripts/check_eval.py     # ~1 min, both must pass
 
-# 1. Track B first -- it is the headline and it never trained.
+# 1. Track B first -- the headline, and only 20% trained.
 python scripts/prep_retrofit_data.py                        # ~6 min
 python scripts/verify_retrofit.py                           # ~4 min, must say "surgery is exact"
 CUDA_VISIBLE_DEVICES=0 python scripts/train_retrofit.py \
     --adapter-init identity --tag retro_identity \
     --steps 1000 --batch 2 --accum 2 --seq 256 --rbar 4 --k 2 --lr 1e-4 --eval-every 200
-#   ~65 min. The number to look at is the val-loss-vs-r curve it prints:
-#   if loss at r=4 sits below loss at r=1, recurrence was successfully installed.
+#   ~65 min. The number to look at is the val-loss-vs-r curve it prints. At step
+#   200 it read 2.624 at r=1 rising to 2.763 at r=16 -- the wrong direction. If
+#   loss at r=4 falls below loss at r=1 by step 1000, recurrence was installed;
+#   if it still rises, run --adapter-init identity_eps0.05 next to test whether
+#   the zero-initialised state coupling is what is holding it in that basin.
 
 # 2. Track A ablations, on the other GPU, in parallel with the above.
 CUDA_VISIBLE_DEVICES=1 python scripts/run_sweep.py --steps 3000 --lr 3e-4 --gpus 0
