@@ -62,7 +62,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-4B-Base")
     ap.add_argument("--split", default="9,18,9")
-    ap.add_argument("--adapter-init", default="identity", choices=["identity", "paper", "sum"])
+    ap.add_argument("--adapter-init", default="identity")  # identity | paper | sum | identity_eps<E>
     ap.add_argument("--injection", default="concat", choices=["concat", "add", "none"])
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--batch", type=int, default=2)

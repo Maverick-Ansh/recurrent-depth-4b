@@ -179,6 +179,18 @@ class RecurrentDepthRetrofit(nn.Module):                                        
             if mode == "identity":              # A([s,e]) = e  -> r=1 is the base model
                 W.zero_()
                 W[:, h:].copy_(torch.eye(h, dtype=W.dtype))
+            elif mode.startswith("identity_eps"):
+                # A([s,e]) = eps*s + e. The identity init leaves the state
+                # multiplied by exactly zero, so the loop is a no-op at step 0
+                # and the only gradient into the state half comes through
+                # whatever the loop already does with it. A small non-zero eps
+                # breaks that symmetry -- recurrence starts weak instead of
+                # absent -- while keeping the r=1 function close to the base
+                # model's. eps is read off the suffix, e.g. "identity_eps0.05".
+                eps = float(mode.split("identity_eps")[1] or 0.05)
+                W.zero_()
+                W[:, :h].copy_(eps * torch.eye(h, dtype=W.dtype))
+                W[:, h:].copy_(torch.eye(h, dtype=W.dtype))
             elif mode == "sum":                 # A([s,e]) = s + e
                 W[:, :h].copy_(torch.eye(h, dtype=W.dtype))
                 W[:, h:].copy_(torch.eye(h, dtype=W.dtype))
