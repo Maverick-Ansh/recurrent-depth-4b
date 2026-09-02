@@ -108,18 +108,23 @@ def main():
         print(f"   r={r:2d}  loss {o['loss'].item():.4f}   token_corr {tc:+.3f}", flush=True)
     report["untrained_loss_vs_r"] = untrained
 
-    # the paper-faithful init, for contrast
-    m2, _ = build_retrofit(args.model, split=split, adapter_init="paper",
-                           backprop_depth=args.k, device=dev)
-    m2.calibrate(x)
+    # The paper-faithful init, for contrast. Re-initialise the adapter in place
+    # rather than building a second 4B model -- two of them do not fit on a T4.
+    saved = m.adapter.weight.detach().clone()
+    m._init_adapter("paper")
     with torch.no_grad():
-        paper_r1 = m2(x, r=1, targets=y)["loss"].item()
-        paper_r8 = m2(x, r=8, targets=y)["loss"].item()
+        paper_r1 = m(x, r=1, targets=y)["loss"].item()
+        paper_r8 = m(x, r=8, targets=y)["loss"].item()
+    m.adapter.weight.data.copy_(saved)
+    m.adapter_init = "identity"
+    del saved
     report["paper_init_untrained"] = {"r1": paper_r1, "r8": paper_r8}
     print(f"[bracket] paper-style random adapter, untrained: r=1 {paper_r1:.3f}, r=8 {paper_r8:.3f} "
           f"(vs base {base_loss:.3f}) -- this is what 'destroys the pretrained function' means",
           flush=True)
-    del m2
+    with torch.no_grad():
+        chk = m(x, r=1, targets=y)["loss"].item()
+    assert abs(chk - r1["loss"].item()) < 1e-3, "adapter restore failed"
     torch.cuda.empty_cache()
 
     # -------------------------------------------------------------- 3. it fits
