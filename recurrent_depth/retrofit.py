@@ -83,9 +83,9 @@ class LoRALinear(nn.Module):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.rank, self.scale = rank, alpha / rank
-        dt = base.weight.dtype
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=dt))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=dt))
+        dt, dv = base.weight.dtype, base.weight.device
+        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=dt, device=dv))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=dt, device=dv))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))   # B stays zero: dW = 0 at init
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
