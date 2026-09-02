@@ -35,24 +35,24 @@ so `sample_r` returns ONE integer per micro-batch, not one per sequence.
 """
 
 from __future__ import annotations
-import math
-import torch
-
-
-def sample_r(rbar: float, sigma: float = 0.5, generator: torch.Generator | None = None,
-             n: int = 1, device="cpu") -> torch.Tensor:
+import math                                                                                         # +-- SAMPLING THE DEPTH, AND PINNING AN AMBIGUITY ---------------
+import torch                                                                                        # | A depth is drawn once per micro-batch, not once per sequence,
+                                                                                                    # | so that parallel workers all run the same number of turns and
+                                                                                                    # | none sits idle waiting for the deepest one. The distribution
+def sample_r(rbar: float, sigma: float = 0.5, generator: torch.Generator | None = None,             # | is log-normal Poisson: a normal draw is exponentiated to give
+             n: int = 1, device="cpu") -> torch.Tensor:                                             # | a rate, the rate feeds a Poisson, and one is added so at least
     """Draw n samples from Lambda: tau ~ N(log(rbar) - sigma^2/2, sigma); r ~ Poisson(e^tau) + 1."""
-    tau = torch.normal(
-        mean=torch.full((n,), math.log(rbar) - 0.5 * sigma ** 2, device=device),
-        std=sigma, generator=generator,
-    )
-    return torch.poisson(torch.exp(tau), generator=generator).long() + 1
-
-
-def selftest_matches_figure3(tol_mean=0.4, tol_median=1.0) -> dict:
-    """Assert our Lambda reproduces the moments annotated on the paper's Figure 3."""
-    g = torch.Generator().manual_seed(0)
-    r = sample_r(32.0, 0.5, generator=g, n=2_000_000).float()
+    tau = torch.normal(                                                                             # | one turn always happens. The subtraction of half the variance
+        mean=torch.full((n,), math.log(rbar) - 0.5 * sigma ** 2, device=device),                    # | inside the normal is what makes the mean of the exponential
+        std=sigma, generator=generator,                                                             # | come out at rbar rather than above it. Most draws land below
+    )                                                                                               # | rbar and a few land far above, which is what teaches the model
+    return torch.poisson(torch.exp(tau), generator=generator).long() + 1                            # | to stay sensible at depths it rarely sees. The self-test
+                                                                                                    # | exists because the paper's wording does not say whether sigma
+                                                                                                    # | is a standard deviation or a variance, and the two give
+def selftest_matches_figure3(tol_mean=0.4, tol_median=1.0) -> dict:                                 # | different distributions. Reading it as a standard deviation
+    """Assert our Lambda reproduces the moments annotated on the paper's Figure 3."""               # | reproduces the mean and median printed on the paper's own
+    g = torch.Generator().manual_seed(0)                                                            # | Figure 3; reading it as a variance does not. The assertion
+    r = sample_r(32.0, 0.5, generator=g, n=2_000_000).float()                                       # | pins the reading instead of leaving it to the reader.
     stats = {"mean": r.mean().item(), "median": r.median().item(), "mode": r.mode().values.item()}
     assert abs(stats["mean"] - 33.0) < tol_mean, f"Fig.3 says Mean=33.0, got {stats['mean']:.2f}"
     assert abs(stats["median"] - 29.0) < tol_median, f"Fig.3 says Median=29.0, got {stats['median']}"

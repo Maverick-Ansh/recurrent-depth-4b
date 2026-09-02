@@ -22,23 +22,23 @@ import numpy as np
 from data import tasks
 
 
-def _pack(items, pad=tasks.PAD):
-    """items: list of (prompt_ids, answer_ids). Returns padded ids + answer mask."""
-    seqs, masks = [], []
-    for prompt, answer in items:
-        full = prompt + answer + [tasks.EOS]
-        seqs.append(full)
-        m = [0] * len(prompt) + [1] * (len(answer) + 1)
-        masks.append(m)
-    L = max(len(s) for s in seqs)
-    ids = np.full((len(seqs), L), pad, dtype=np.int64)
-    msk = np.zeros((len(seqs), L), dtype=bool)
-    for i, (s, m) in enumerate(zip(seqs, masks)):
-        ids[i, :len(s)] = s
-        msk[i, :len(m)] = m
-    return torch.from_numpy(ids), torch.from_numpy(msk)
-
-
+def _pack(items, pad=tasks.PAD):                                                                    # +-- STRICT EXACT MATCH IN ONE FORWARD PASS ---------------------
+    """items: list of (prompt_ids, answer_ids). Returns padded ids + answer mask."""                # | The prompt, the answer and a terminating end marker are laid
+    seqs, masks = [], []                                                                            # | out as one sequence and a mask marks which positions are the
+    for prompt, answer in items:                                                                    # | answer. The model sees the whole thing once and its prediction
+        full = prompt + answer + [tasks.EOS]                                                        # | at each position is compared to what actually follows. An item
+        seqs.append(full)                                                                           # | counts only if every masked position is right, the end marker
+        m = [0] * len(prompt) + [1] * (len(answer) + 1)                                             # | included. Requiring the end marker closes a real loophole: a
+        masks.append(m)                                                                             # | model emitting 1275 where the answer was 127 would otherwise
+    L = max(len(s) for s in seqs)                                                                   # | score correct on all three digits it did produce. Requiring
+    ids = np.full((len(seqs), L), pad, dtype=np.int64)                                              # | all positions makes this an upper bound on free-running greedy
+    msk = np.zeros((len(seqs), L), dtype=bool)                                                      # | decoding rather than a different metric, since the two can
+    for i, (s, m) in enumerate(zip(seqs, masks)):                                                   # | only diverge on items the model already gets wrong. Scoring
+        ids[i, :len(s)] = s                                                                         # | this way costs one forward pass per batch instead of one per
+        msk[i, :len(m)] = m                                                                         # | generated token, which is what makes a nine-point depth sweep
+    return torch.from_numpy(ids), torch.from_numpy(msk)                                             # | across seventeen difficulty cells affordable at all. Padding
+                                                                                                    # | goes at the end of each sequence, and attention is causal, so
+                                                                                                    # | a real position never attends to a pad.
 @torch.no_grad()
 def exact_match(model, items, r: int, device="cuda", batch_size: int = 64, amp_dtype=None):
     """Fraction of items where every answer token (and the EOS) is argmax-correct."""
@@ -58,21 +58,21 @@ def exact_match(model, items, r: int, device="cuda", batch_size: int = 64, amp_d
     return correct / len(items)
 
 
-@torch.no_grad()
-def sweep(model, r_values, device="cuda", n_per_cell: int = 256, seed: int = 1234,
-          amp_dtype=None, batch_size: int = 64):
-    """Full (task x difficulty x r) accuracy grid, plus each cell's shortcut floor."""
-    out = {}
-    for task in tasks.TASKS:
-        for level in tasks.levels_for(task):
-            items = tasks.build_eval_set(task, level, n=n_per_cell, seed=seed)
-            key = f"{task}/{level}"
-            out[key] = {
-                "floor": tasks.shortcut_baseline(task, level),
-                "acc": {int(r): exact_match(model, items, r, device, batch_size, amp_dtype)
-                        for r in r_values},
-            }
-    return out
+@torch.no_grad()                                                                                    # +-- THE INSTRUMENT THAT HAS THE EFFECT IN RANGE ----------------
+def sweep(model, r_values, device="cuda", n_per_cell: int = 256, seed: int = 1234,                  # | sweep walks every task and difficulty and carries each cell's
+          amp_dtype=None, batch_size: int = 64):                                                    # | constant-guess floor alongside its accuracy, so no number is
+    """Full (task x difficulty x r) accuracy grid, plus each cell's shortcut floor."""              # | ever read in isolation. answer_loss_vs_r exists because the
+    out = {}                                                                                        # | first attempt at measuring the central claim used loss over
+    for task in tasks.TASKS:                                                                        # | the whole packed byte stream and read flat in r while accuracy
+        for level in tasks.levels_for(task):                                                        # | was visibly climbing. The reason is that the stream is mostly
+            items = tasks.build_eval_set(task, level, n=n_per_cell, seed=seed)                      # | prompts, and prompts here are random operands, random
+            key = f"{task}/{level}"                                                                 # | generator symbols and random keys, which cannot be predicted
+            out[key] = {                                                                            # | however well the model reasons. Averaging over them buries the
+                "floor": tasks.shortcut_baseline(task, level),                                      # | handful of answer positions that are the only place reasoning
+                "acc": {int(r): exact_match(model, items, r, device, batch_size, amp_dtype)         # | can show up. Restricting the loss to answer tokens puts the
+                        for r in r_values},                                                         # | effect back in range. The full-stream version is kept anyway,
+            }                                                                                       # | because its flatness against a rising accuracy curve is itself
+    return out                                                                                      # | the finding.
 
 
 @torch.no_grad()
@@ -114,21 +114,21 @@ def answer_loss_vs_r(model, r_values, device="cuda", n_per_task: int = 128,
     return out
 
 
-@torch.no_grad()
-def val_loss_vs_r(model, val_tokens: np.ndarray, r_values, block: int = 256,
-                  n_blocks: int = 32, device="cuda", amp_dtype=None, batch_size: int = 8):
+@torch.no_grad()                                                                                    # +-- THE PERPLEXITY-AGAINST-DEPTH CURVE -------------------------
+def val_loss_vs_r(model, val_tokens: np.ndarray, r_values, block: int = 256,                        # | This is the paper's own Figure 6 measurement: held-out loss
+                  n_blocks: int = 32, device="cuda", amp_dtype=None, batch_size: int = 8):          # | evaluated at each recurrence depth, on a model trained with
     """Held-out next-token loss at each recurrence depth -- the paper's Fig. 6 right panel.
 
     Fig. 6: "Plot of val ppl at recurrent depths 1, 4, 8, 16, 32, 64. During
     training, the model improves in perplexity on all levels of recurrence."
     """
-    model.eval()
-    n = min(n_blocks, (len(val_tokens) - 1) // block)
-    xs = np.stack([val_tokens[i * block:(i + 1) * block] for i in range(n)]).astype(np.int64)
+    model.eval()                                                                                    # | depths drawn at random. Blocks are cut from a fixed held-out
+    n = min(n_blocks, (len(val_tokens) - 1) // block)                                               # | stream at fixed offsets, so the same text is scored at every
+    xs = np.stack([val_tokens[i * block:(i + 1) * block] for i in range(n)]).astype(np.int64)       # | depth and the only thing varying is r. It reports whatever the
     ys = np.stack([val_tokens[i * block + 1:(i + 1) * block + 1] for i in range(n)]).astype(np.int64)
-    X, Y = torch.from_numpy(xs).to(device), torch.from_numpy(ys).to(device)
-    res = {}
-    for r in r_values:
+    X, Y = torch.from_numpy(xs).to(device), torch.from_numpy(ys).to(device)                         # | packed stream contains, prompts included, which is exactly why
+    res = {}                                                                                        # | the answer-only version above exists next to it rather than
+    for r in r_values:                                                                              # | instead of it.
         tot, cnt = 0.0, 0
         for b in range(0, len(X), batch_size):
             ctx = (torch.autocast("cuda", dtype=amp_dtype) if amp_dtype is not None
