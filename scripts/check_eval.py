@@ -103,19 +103,31 @@ for task in tasks.TASKS:
           "  ".join(f"{lv}={f:.3f}" for lv, f in ents))
 
 # --------------------------------------------------- eval set is not memorisable
-print("\n[4] Held-out check: eval prompts must not appear in the training stream")
+print("\n[4] Leakage per cell: fraction of eval prompts that also occur in a 400k-token")
+print("    training stream. A leaky cell can be solved by table lookup, so it cannot")
+print("    carry the claim -- but it is legitimate as the easy end of the axis.")
 train = tasks.build_train_corpus(400_000, seed=0, text=None)
 train_str = train.tokens.tobytes()
-leaks = 0
+print(f"    {'cell':<18}{'prompt space':>14}{'leak':>8}  class")
+surprises = 0
 for task in tasks.TASKS:
     for level in tasks.levels_for(task):
-        for prompt, _ in tasks.build_eval_set(task, level, n=32, seed=1234)[:32]:
-            if len(prompt) >= 8 and np.array(prompt[1:], dtype=np.uint16).tobytes() in train_str:
-                leaks += 1
-print(f"    {leaks} of {sum(32 for t in tasks.TASKS for _ in tasks.levels_for(t))} "
-      f"eval prompts also occur verbatim in a 400k-token training stream")
-if leaks > 5:
-    problems.append(f"{leaks} eval prompts leak into the training distribution")
+        items = tasks.build_eval_set(task, level, n=64, seed=1234)
+        hit = sum(1 for prompt, _ in items
+                  if np.array(prompt[1:], dtype=np.uint16).tobytes() in train_str)
+        frac = hit / len(items)
+        space = tasks.prompt_space(task, level)
+        tab = tasks.is_tabulable(task, level)
+        cls = "tabulable" if tab else "must compute"
+        if frac > 0.10 and not tab:
+            surprises += 1
+            cls = "LEAKS BUT SHOULD NOT"
+            problems.append(f"{task}/{level} leaks {frac:.2f} but its prompt space is {space:.1e}")
+        sp = "inf" if space == float("inf") else f"{space:.1e}"
+        print(f"    {task+'/'+str(level):<18}{sp:>14}{frac:>8.2f}  {cls}")
+CLAIM_CELLS = tasks.claim_cells()
+print(f"    {surprises} unexpected leaks")
+print(f"    claim-carrying cells ({len(CLAIM_CELLS)}): {', '.join(CLAIM_CELLS)}")
 
 # --------------------------------------------------------------------- verdict
 print("\n" + "=" * 78)

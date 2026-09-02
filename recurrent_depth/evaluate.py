@@ -76,6 +76,45 @@ def sweep(model, r_values, device="cuda", n_per_cell: int = 256, seed: int = 123
 
 
 @torch.no_grad()
+def answer_loss_vs_r(model, r_values, device="cuda", n_per_task: int = 128,
+                     seed: int = 4321, amp_dtype=None, batch_size: int = 32):
+    """Held-out loss on ANSWER tokens only, per task, at each recurrence depth.
+
+    Why this exists: our first measurement was loss over the whole packed byte
+    stream, and it was flat in r while task accuracy was clearly rising.  The
+    reason is that most bytes in the stream are the *prompts* -- random operands,
+    random generator symbols, random key/value pairs -- which are irreducibly
+    unpredictable.  Averaging over them buries the answer tokens, which are the
+    only positions where reasoning can show up.  Loss restricted to answer
+    positions is the instrument that actually has the effect in range.
+    """
+    model.eval()
+    out = {}
+    for task in tasks.TASKS:
+        items = []
+        for level in tasks.levels_for(task):
+            items += tasks.build_eval_set(task, level, n=n_per_task, seed=seed)
+        per_r = {}
+        for r in r_values:
+            tot, cnt = 0.0, 0
+            for b in range(0, len(items), batch_size):
+                ids, mask = _pack(items[b:b + batch_size])
+                ids, mask = ids.to(device), mask.to(device)
+                ctx = (torch.autocast("cuda", dtype=amp_dtype) if amp_dtype is not None
+                       else torch.autocast("cuda", enabled=False))
+                with ctx:
+                    logits = model(ids[:, :-1], r=int(r))["logits"]
+                lp = torch.log_softmax(logits.float(), -1)
+                tgt, m = ids[:, 1:], mask[:, 1:]
+                nll = -lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                tot += float((nll * m).sum())
+                cnt += int(m.sum())
+            per_r[int(r)] = tot / max(cnt, 1)
+        out[task] = per_r
+    return out
+
+
+@torch.no_grad()
 def val_loss_vs_r(model, val_tokens: np.ndarray, r_values, block: int = 256,
                   n_blocks: int = 32, device="cuda", amp_dtype=None, batch_size: int = 8):
     """Held-out next-token loss at each recurrence depth -- the paper's Fig. 6 right panel.

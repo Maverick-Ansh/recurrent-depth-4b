@@ -66,9 +66,30 @@ def encode(s: str) -> list[int]:
 
 
 # ------------------------------------------------------------------- perm task
+# The word problem is stated over a FIXED GENERATING SET, and that is also what
+# makes it learnable at small scale: the model has to read only |GENERATORS|
+# distinct input symbols while tracking a 120-state automaton, rather than first
+# memorising a 120 x 120 multiplication table.  The hardness result is unchanged
+# -- S5 is the smallest non-solvable symmetric group, so its word problem over a
+# fixed generating set is NC^1-complete and a constant-depth (TC^0) transformer
+# cannot solve it for growing n unless TC^0 = NC^1.
+GENERATORS = [
+    (1, 0, 2, 3, 4),      # transposition (0 1)
+    (0, 2, 1, 3, 4),      # transposition (1 2)
+    (1, 2, 3, 4, 0),      # 5-cycle
+    (4, 0, 1, 2, 3),      # its inverse
+    (0, 1, 2, 3, 4),      # identity, so the answer is not a function of n alone
+]
+# |GENERATORS|^n distinct prompts exist at level n: 25 at n=2, 625 at n=4, 390k
+# at n=8, 1.5e11 at n=16. The two smallest levels are therefore memorisable by
+# table lookup, which `scripts/check_eval.py` measures per cell rather than
+# hiding -- they are the easy end of the difficulty axis and the claim is carried
+# by n >= 8, where memorisation is not available.
+
+
 def make_perm(rng: random.Random, n: int) -> tuple[list[int], list[int]]:
-    """'<perm symbols> = <result>'  -> (tokens, answer_token_positions_payload)."""
-    ps = [S5[rng.randrange(120)] for _ in range(n)]
+    """'<generator symbols> = <composed state>'."""
+    ps = [GENERATORS[rng.randrange(len(GENERATORS))] for _ in range(n)]
     acc = (0, 1, 2, 3, 4)
     for p in ps:
         acc = compose(acc, p)
@@ -105,10 +126,39 @@ def make_recall(rng: random.Random, n_pairs: int):
 # sequential depth we believe they require -- the axis C1 predicts saturation
 # should track.
 PERM_LEVELS = [2, 4, 8, 16, 24]
-ADD_LEVELS = [(2, 1), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (4, 2)]
+ADD_LEVELS = [(2, 1), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (3, 3), (4, 2)]
 RECALL_LEVELS = [4, 8, 16, 24]
 
 TASKS = ("perm", "add", "recall")
+
+# How many distinct prompts a cell can produce.  A cell whose space is small
+# compared to the training stream will be covered exhaustively, so a model can
+# score on it by table lookup instead of by computing -- which is a legitimate
+# easy end of the difficulty axis, but cannot carry a claim about reasoning.
+# We compute this rather than assume it, and `scripts/check_eval.py` prints it
+# so every number in the report can be read as "computed" or "possibly recalled".
+TABULABLE_THRESHOLD = 1_000_000
+
+
+def prompt_space(task: str, level) -> float:
+    if task == "perm":
+        return float(len(GENERATORS)) ** level
+    if task == "add":
+        n_ops, n_dig = level
+        span = 10.0 if n_dig == 1 else 9.0 * 10 ** (n_dig - 1)
+        return span ** n_ops
+    if task == "recall":                       # C(676, k) * 26^k * k, astronomically large
+        return float("inf")
+    raise ValueError(task)
+
+
+def is_tabulable(task: str, level) -> bool:
+    return prompt_space(task, level) < TABULABLE_THRESHOLD
+
+
+def claim_cells():
+    """The cells on which a reasoning claim can actually be made."""
+    return [f"{t}/{l}" for t in TASKS for l in levels_for(t) if not is_tabulable(t, l)]
 
 
 def sample_example(rng: random.Random, task: str, level):

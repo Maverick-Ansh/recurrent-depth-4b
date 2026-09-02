@@ -21,16 +21,17 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def build_queue(steps: int, lr: float, out: str):
     """(name, argv) pairs, ordered so the claims that matter land first."""
-    two_seeds = ["rec", "fixed1", "fixedr"]          # C1, C2, C1-mechanism
-    one_seed = ["noinject", "prenorm", "dets0", "addinject", "nonormparams", "fullbp"]
+    # Two seeds on the arms that carry C1/C2; one on the ablations, whose read-out
+    # is a qualitative "does the r-curve survive at all", not a small delta.
+    two_seeds = ["rec", "fixed1", "fixedr"]           # C1, C2, C1-mechanism
+    one_seed = ["noinject", "prenorm", "dets0", "hi_lr", "fullbp"]
     q = []
     for arm in two_seeds:
         for seed in (0, 1):
             q.append((f"{arm}_s{seed}", arm, seed))
     for arm in one_seed:
         q.append((f"{arm}_s0", arm, 0))
-    for seed in (0, 1):                               # FLOP-matched control, runs longest
-        q.append((f"fixed1_flop_s{seed}", "fixed1_flop", seed))
+    q.append(("fixed1_flop_s0", "fixed1_flop", 0))    # FLOP-matched control, runs longest
     jobs = []
     for name, arm, seed in q:
         jobs.append((name, [sys.executable, "scripts/train_scratch.py",

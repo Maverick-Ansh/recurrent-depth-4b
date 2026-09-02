@@ -48,7 +48,7 @@ from recurrent_depth.config import RecurrentDepthConfig
 from recurrent_depth.model import RecurrentDepthLM
 from recurrent_depth.sampling import sample_r
 from recurrent_depth.diagnostics import token_correlation, recurrence_stats
-from recurrent_depth.evaluate import sweep, val_loss_vs_r
+from recurrent_depth.evaluate import sweep, val_loss_vs_r, answer_loss_vs_r
 
 # --------------------------------------------------------------------- the arms
 # Each arm names the claim it exists to test.
@@ -74,6 +74,10 @@ ARMS = {
     "nonormparams":   dict(claim="C5b", cfg=dict(norm_affine=False), train_r="random"),
     # Sec. 3.3: k = r, i.e. full backprop through the unrolling
     "fullbp":         dict(claim="C4", cfg={}, train_r="random", full_bp=True),
+    # Sec. 4.3: the peak learning rate is what separated their Bad Run 2 from the
+    # main run ("dropping the peak learning rate to 4e-5"). Same arm as `rec`,
+    # 3.3x the lr, to see whether the collapse ordering reproduces at small scale.
+    "hi_lr":          dict(claim="C5-lr", cfg={}, train_r="random", lr_mult=10/3),
 }
 
 
@@ -142,6 +146,7 @@ def main():
     dev = args.device
 
     steps = args.steps * (int(args.rbar) if args.arm == "fixed1_flop" else 1)
+    lr = args.lr * spec.get("lr_mult", 1.0)
 
     cfg = RecurrentDepthConfig(
         vocab_size=tasks.VOCAB_SIZE, hidden=args.hidden, n_heads=args.heads,
@@ -161,7 +166,7 @@ def main():
     nodecay = [p_ for n, p_ in model.named_parameters() if p_.dim() < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd},
                              {"params": nodecay, "weight_decay": 0.0}],
-                            lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+                            lr=lr, betas=(0.9, 0.95), eps=1e-8)
     scaler = torch.amp.GradScaler("cuda")      # fp16 on sm_75, see module docstring
 
     gen = torch.Generator().manual_seed(args.seed + 777)
@@ -170,7 +175,7 @@ def main():
 
     def lr_at(it):
         # "warm-up and a constant learning rate" (Sec. 4.1)
-        return args.lr * min(1.0, (it + 1) / args.warmup)
+        return lr * min(1.0, (it + 1) / args.warmup)
 
     for it in range(steps):
         for g in opt.param_groups:
@@ -217,6 +222,7 @@ def main():
     grid = sweep(model, r_values, device=dev, n_per_cell=256, amp_dtype=torch.float16)
     vl = val_loss_vs_r(model, val_tok, r_values, block=args.block, n_blocks=48,
                        device=dev, amp_dtype=torch.float16)
+    al = answer_loss_vs_r(model, r_values, device=dev, amp_dtype=torch.float16)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         probe = torch.from_numpy(np.stack(
@@ -227,11 +233,11 @@ def main():
 
     result = {
         "arm": args.arm, "claim": spec["claim"], "seed": args.seed,
-        "steps": steps, "lr": args.lr, "rbar": args.rbar, "k": args.k,
+        "steps": steps, "lr": lr, "rbar": args.rbar, "k": args.k,
         "config": cfg.to_dict(), "n_params": model.n_params(),
         "tokens_seen": steps * args.batch_size * args.block,
         "wall_s": time.time() - t0,
-        "history": hist, "val_loss_vs_r": vl, "grid": grid,
+        "history": hist, "val_loss_vs_r": vl, "answer_loss_vs_r": al, "grid": grid,
         "recurrence_stats": stats,
         "materialized_params": {int(r): model.materialized_params(int(r)) for r in r_values},
     }
@@ -241,6 +247,8 @@ def main():
                os.path.join(args.out, f"{tag}.pt"))
     print(f"[{tag}] done in {result['wall_s']:.0f}s -> {res_path}")
     print(f"[{tag}] val loss by r: " + "  ".join(f"{r}:{v:.3f}" for r, v in vl.items()))
+    for t, d_ in al.items():
+        print(f"[{tag}] ANSWER loss {t:<7}: " + "  ".join(f"{r}:{v:.3f}" for r, v in d_.items()))
 
 
 if __name__ == "__main__":
