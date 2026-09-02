@@ -369,6 +369,10 @@ was resized with a full deviations table, what broke in the evaluation before an
 worked, results bracketed by their floors, a verdict per claim, and an exhaustive list of
 what was *not* tested.
 
+Picking the work back up on a fresh machine: **[RESUME.md](RESUME.md)** — what is
+permanent, what was ephemeral, the cost of regenerating each piece, and the two
+open questions stated so they can be resumed cold.
+
 ## 9. Citation
 
 ```bibtex
