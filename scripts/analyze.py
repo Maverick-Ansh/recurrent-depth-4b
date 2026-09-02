@@ -11,9 +11,12 @@ import argparse
 import glob
 import json
 import os
+import sys
 from collections import defaultdict
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -25,20 +28,32 @@ TASK_GROUP = {"perm": "depth-hard", "add": "depth-hard", "recall": "memory-hard"
 def load(results_dir):
     runs = defaultdict(list)
     for p in sorted(glob.glob(f"{results_dir}/*.json")):
-        if os.path.basename(p).startswith(("retro", "bench", "retrofit_gate")):
+        if os.path.basename(p).startswith(("retro", "bench", "retrofit_gate", "summary",
+                                           "mechanisms")):
             continue
         d = json.load(open(p))
+        if "arm" not in d:
+            continue
         runs[d["arm"]].append(d)
     return runs
 
 
-def agg_task(d, task):
-    """Mean accuracy over that task's difficulty cells, per r."""
+def agg_task(d, task, only_claim_cells=False):
+    """Mean accuracy over that task's difficulty cells, per r.
+
+    `only_claim_cells` restricts to cells whose prompt space is too large to
+    tabulate, i.e. the ones where a score has to be computed rather than recalled.
+    Both views are reported: mixing them would let memorisation on the easy end
+    masquerade as reasoning.
+    """
+    from data import tasks as T
+    keep = set(T.claim_cells())
     rs = sorted(int(r) for r in next(iter(d["grid"].values()))["acc"])
     out = {}
     for r in rs:
-        vals = [c["acc"][str(r)] for k, c in d["grid"].items() if k.split("/")[0] == task]
-        out[r] = float(np.mean(vals))
+        vals = [c["acc"][str(r)] for k, c in d["grid"].items()
+                if k.split("/")[0] == task and (not only_claim_cells or k in keep)]
+        out[r] = float(np.mean(vals)) if vals else float("nan")
     return out
 
 
@@ -70,13 +85,16 @@ def main():
     print("C1  test-time recurrence vs accuracy  (mean over difficulty cells, +- std over seeds)")
     print("=" * 92)
     hdr_rs = sorted(int(r) for r in next(iter(next(iter(runs.values()))[0]["grid"].values()))["acc"])
-    print(f"{'arm':<16}{'task':<10}" + "".join(f"{'r='+str(r):>10}" for r in hdr_rs))
+    print("(claim-carrying cells only -- prompt space too large to tabulate)")
+    print(f"{'arm':<16}{'task':<22}" + "".join(f"{'r='+str(r):>9}" for r in hdr_rs))
     for arm in sorted(runs):
         for t in tasks:
-            mu, sd = mean_std(runs[arm], lambda d: agg_task(d, t))
+            mu, sd = mean_std(runs[arm], lambda d: agg_task(d, t, only_claim_cells=True))
             summary[(arm, t)] = (mu, sd)
-            row = "".join(f"{mu[r]:>10.3f}" for r in hdr_rs)
-            print(f"{arm:<16}{t+' ('+TASK_GROUP[t][0]+')':<10}{row}")
+            mu_all, _ = mean_std(runs[arm], lambda d: agg_task(d, t))
+            summary[(arm, t, "all")] = (mu_all, _)
+            row = "".join(f"{mu[r]:>9.3f}" for r in hdr_rs)
+            print(f"{arm:<16}{t+' ('+TASK_GROUP[t]+')':<22}{row}")
         print()
 
     # ------------------------------------------------------ C1 figure
@@ -117,9 +135,12 @@ def main():
                 rows.append((key, cell["floor"], best, None)); continue
             sat = min(r for r in sorted(acc) if acc[r] >= 0.95 * best)
             rows.append((key, cell["floor"], best, sat))
-        print(f"{'cell':<18}{'floor':>8}{'best acc':>10}{'r*':>6}")
-        for k, f, b, s in rows:
-            print(f"{k:<18}{f:>8.3f}{b:>10.3f}{(str(s) if s else 'at floor'):>6}")
+        from data import tasks as T
+        keep = set(T.claim_cells())
+        print(f"{'cell':<18}{'floor':>8}{'best acc':>10}{'r*':>6}  class")
+        for k, f, b, sat in rows:
+            cls = "must compute" if k in keep else "tabulable"
+            print(f"{k:<18}{f:>8.3f}{b:>10.3f}{(str(sat) if sat else '--'):>6}  {cls}")
         summary["saturation"] = rows
 
     # ---------------------------------------------- C2: recurrent vs its twin
@@ -142,8 +163,8 @@ def main():
     print("\n" + "=" * 92)
     print("C4/C5  ablations: does the r-curve survive?  (slope = acc@r_max - acc@r=1)")
     print("=" * 92)
-    print(f"{'arm':<16}{'claim':<8}" + "".join(f"{t[:6]+' slope':>14}" for t in tasks) +
-          f"{'tok_corr':>10}")
+    print(f"{'arm':<16}{'claim':<12}" + "".join(f"{t[:6]+' slope':>14}" for t in tasks) +
+          f"{'tok_corr':>10}{'ans loss d':>12}")
     for arm in sorted(runs):
         d0 = runs[arm][0]
         slopes = []
@@ -152,8 +173,43 @@ def main():
             rs = sorted(mu)
             slopes.append(mu[rs[-1]] - mu[rs[0]])
         tc = d0["recurrence_stats"]["token_corr_final"]
-        print(f"{arm:<16}{d0['claim']:<8}" + "".join(f"{s:>+14.3f}" for s in slopes) +
-              f"{tc:>10.3f}")
+        al = d0.get("answer_loss_vs_r", {})
+        if al:
+            rs_ = sorted(int(r) for r in next(iter(al.values())))
+            dl = float(np.mean([al[t][str(rs_[-1])] - al[t][str(rs_[0])] for t in al]))
+        else:
+            dl = float("nan")
+        print(f"{arm:<16}{d0['claim']:<12}" + "".join(f"{s:>+14.3f}" for s in slopes) +
+              f"{tc:>10.3f}{dl:>+12.3f}")
+
+    # ------------------------------------------- answer-only loss vs r
+    print("\n" + "=" * 92)
+    print("Held-out loss on ANSWER TOKENS ONLY vs r  (nats/byte; the full-stream")
+    print("loss is dominated by irreducibly random prompt bytes -- see REPORT Sec. 4.1)")
+    print("=" * 92)
+    any_al = [d for v in runs.values() for d in v if d.get("answer_loss_vs_r")]
+    if any_al:
+        rs_ = sorted(int(r) for r in next(iter(any_al[0]["answer_loss_vs_r"].values())))
+        print(f"{'arm':<16}{'task':<10}" + "".join(f"{'r='+str(r):>9}" for r in rs_))
+        for arm in sorted(runs):
+            al = runs[arm][0].get("answer_loss_vs_r")
+            if not al:
+                continue
+            for t in tasks:
+                print(f"{arm:<16}{t:<10}" + "".join(f"{al[t][str(r)]:>9.3f}" for r in rs_))
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        for ax, t in zip(axes, tasks):
+            for arm in sorted(runs):
+                al = runs[arm][0].get("answer_loss_vs_r")
+                if al:
+                    ax.plot(rs_, [al[t][str(r)] for r in rs_], marker="o", ms=3, label=arm)
+            ax.set_xscale("log", base=2); ax.set_xlabel("recurrence r")
+            ax.set_title(f"{t} ({TASK_GROUP[t]})"); ax.grid(alpha=0.25)
+        axes[0].set_ylabel("answer-token loss (nats)")
+        axes[-1].legend(fontsize=7)
+        fig.suptitle("Held-out loss on answer tokens vs test-time recurrence")
+        fig.tight_layout(); fig.savefig(f"{args.figures}/answer_loss_vs_r.png", dpi=140)
+        print(f"[fig] {args.figures}/answer_loss_vs_r.png")
 
     # --------------------------------------------------------- val loss vs r
     fig, ax = plt.subplots(figsize=(6, 4.2))
