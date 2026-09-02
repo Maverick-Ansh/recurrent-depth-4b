@@ -64,7 +64,7 @@ LoRA on the core.
 | r̄ , k | 32 , 8 | **A:** 8 , 4 · **B:** 4 , 2 | the whole r-sweep including extrapolation must fit the budget; ratios r̄/k preserved (4:1 vs 4:1) |
 | precision | bf16 on MI250X | **fp16 + GradScaler** | T4 is sm_75; bf16 is emulated there and ~4× slower |
 | learning rate | 4×10⁻⁵ peak, warmup 4096 | **A:** 3×10⁻⁴, warmup 200 | 4×10⁻⁵ is tuned for 3.5B; the *ordering* claim of §4.3 (too high → collapse) is run as its own arm rather than assumed |
-| data | 800B tokens web/code/math, 65536-token BPE | **A:** byte-level task suite · **B:** FineWeb-Edu + open-web-math + the-stack | byte-level means no tokenizer artifact to lose; Track B keeps Qwen's tokenizer |
+| data | 800B tokens, 25% code / 6% math / rest web+scientific | **A:** byte-level task suite · **B:** 4.78M tokens, 59% FineWeb-Edu + 41% open-web-math, **no code** (`the-stack-smol` is gated on the Hub) | byte-level means no tokenizer artifact to lose; Track B keeps Qwen's tokenizer. The missing code split is a real deviation from the paper's mixture and is flagged again in §7 |
 | tokenizer | trained on instruction data | raw bytes (Track A) | removes a confound and a reproducibility hazard |
 | eval | lm-eval-harness, full test sets | 17 exact-ground-truth cells (A); 300-item subsamples (B) | every number is reported with its floor and standard error |
 | **weights** | **all trained** | **Track B: base frozen, LoRA r=16 on the core + adapter + n_c = 29.6M / 4.05B (0.73%)** | **material.** Track B tests whether recurrence can be *installed*, not whether a 4B can be pretrained |
@@ -321,7 +321,11 @@ worth much.
 - **Self-speculative decoding (§6.4).** Implemented nowhere; only C7a and C7b are
   measured.
 - **The full data-mixture question (§4.1).** The paper could not ablate its
-  mixture either; neither can we.
+  mixture either; neither can we. Worse, our Track-B mixture contains **no
+  code at all** — `bigcode/the-stack-smol` turned out to be gated on the Hub and
+  was dropped rather than substituted. The paper's mixture is 25.4% code, and
+  code is one of the two domains where it reports recurrence helping most
+  (§5.2). Any Track-B result should be read as "web + math only".
 - **Locked-step sampling's effect on convergence.** We sample one *r* per
   micro-batch as §4.1 does, but with a single process there are no workers to
   synchronise, so the claim that this "improves compute utilization without
